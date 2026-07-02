@@ -6,3 +6,6 @@ hud-v2-build.log
 build/
 target/
 runs.jsonl
+hud/dist/
+hud/gen/
+hud/icons/icon.iconset/

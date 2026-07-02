@@ -426,6 +426,14 @@
     setInterval(() => update(currentRuns), 250);
     setInterval(pollLocalState, 1000);
     pollLocalState();
+
+    (function loadTauriHudBridge() {
+      if (!window.__TAURI__) return;
+      const script = document.createElement("script");
+      script.src = "hud.js";
+      script.defer = true;
+      document.head.appendChild(script);
+    })();
   </script>
 </body>
 </html>
