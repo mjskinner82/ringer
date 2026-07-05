@@ -46,6 +46,7 @@ DEFAULT_DASHBOARD_PORT_BASE = 8787
 DEFAULT_TOKEN_REGEX = r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"
 ACTIVITY_TAIL_BYTES = 2048
 ACTIVITY_TEXT_LIMIT = 80
+ARTIFACT_WRAPPER_TAIL_BYTES = 256 * 1024
 TASK_REPORT_FILENAMES = ("report.md", "report.html")
 SHEPHERD_MODEL = f"none ({TOOL_NAME}.py)"
 VERIFY_METHOD = "executed-check"
@@ -705,6 +706,7 @@ class StateWriter:
         )
         self.artifact_path = self.artifact.artifact_path(self.run_id, self.run_name)
         self.report_path = self.artifact.report_path(self.run_id, self.run_name)
+        self.artifact_renderer = ArtifactRenderer(self.artifact_path)
         self.report_written = False
 
     def start(self) -> None:
@@ -824,7 +826,7 @@ class StateWriter:
 
     def _write_status_artifact_safe(self, state: dict[str, Any]) -> None:
         try:
-            html = render_status_html(state)
+            html = self.artifact_renderer.render_status_html(state)
             atomic_write_text(self.artifact_path, html)
         except Exception as exc:
             print(f"artifact render error (status page, non-fatal): {exc}", file=sys.stderr)
@@ -833,7 +835,7 @@ class StateWriter:
         if not self.artifact.enabled:
             return
         try:
-            html = render_final_report_html(state)
+            html = self.artifact_renderer.render_final_report_html(state)
             atomic_write_text(self.report_path, html)
             self.report_written = True
             # Re-flush the plain state JSON so report_ready/report_path are accurate for
@@ -849,7 +851,7 @@ class StateWriter:
     def _write_index_safe(self) -> None:
         try:
             entries = scan_run_states(self.state_dir)
-            html = render_artifact_index_html(entries)
+            html = self.artifact_renderer.render_artifact_index_html(entries)
             atomic_write_text(self.artifact.index_out, html)
         except Exception as exc:
             print(f"artifact render error (index, non-fatal): {exc}", file=sys.stderr)
@@ -1103,7 +1105,149 @@ ARTIFACT_BASE_CSS = """
 """
 
 
-def render_status_html(state: dict[str, Any]) -> str:
+def file_href(path: Path) -> str:
+    try:
+        return path.resolve().as_uri()
+    except ValueError:
+        return "file://" + urllib.parse.quote(str(path))
+
+
+def sanitize_artifact_name(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")
+    return sanitized or "artifact"
+
+
+def is_html_artifact(path: Path) -> bool:
+    return path.suffix.lower() in {".html", ".htm"}
+
+
+class ArtifactRenderer:
+    def __init__(self, artifact_path: Path) -> None:
+        self.artifact_dir = artifact_path.parent
+        self._wrapper_cache: dict[tuple[Path, Path], tuple[int, int]] = {}
+
+    def render_status_html(self, state: dict[str, Any]) -> str:
+        return render_status_html(state, renderer=self, force_wrappers=False)
+
+    def render_final_report_html(self, state: dict[str, Any]) -> str:
+        return render_final_report_html(state, renderer=self, force_wrappers=True)
+
+    def render_artifact_index_html(self, entries: list[dict[str, Any]]) -> str:
+        return render_artifact_index_html(entries, renderer=self, force_wrappers=False)
+
+    def link_for_source(
+        self,
+        source_path: Path,
+        *,
+        state: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        run_name: str | None = None,
+        task_key: str,
+        force: bool = False,
+    ) -> str:
+        if is_html_artifact(source_path):
+            return file_href(source_path)
+        if not source_path.exists():
+            return file_href(source_path)
+
+        wrapper_path = self.wrapper_path(
+            run_id=str(run_id or (state or {}).get("run_id") or "run"),
+            task_key=task_key,
+            source_name=source_path.name,
+        )
+        self.write_wrapper(
+            source_path,
+            wrapper_path,
+            run_name=str(run_name or (state or {}).get("run_name") or "ringer"),
+            task_key=task_key,
+            force=force,
+        )
+        return file_href(wrapper_path)
+
+    def wrapper_path(self, *, run_id: str, task_key: str, source_name: str) -> Path:
+        filename = f"{sanitize_artifact_name(task_key)}--{sanitize_artifact_name(source_name)}.html"
+        return self.artifact_dir / "view" / sanitize_artifact_name(run_id) / filename
+
+    def write_wrapper(
+        self,
+        source_path: Path,
+        wrapper_path: Path,
+        *,
+        run_name: str,
+        task_key: str,
+        force: bool = False,
+    ) -> None:
+        stat = source_path.stat()
+        cache_key = (source_path.resolve(), wrapper_path)
+        current = (stat.st_mtime_ns, stat.st_size)
+        if not force and wrapper_path.exists() and self._wrapper_cache.get(cache_key) == current:
+            return
+
+        html = render_file_wrapper_html(
+            source_path=source_path,
+            source_stat=stat,
+            run_name=run_name,
+            task_key=task_key,
+        )
+        atomic_write_text(wrapper_path, html)
+        self._wrapper_cache[cache_key] = current
+
+
+def render_file_wrapper_html(
+    *,
+    source_path: Path,
+    source_stat: os.stat_result,
+    run_name: str,
+    task_key: str,
+) -> str:
+    size = int(source_stat.st_size)
+    truncated = size > ARTIFACT_WRAPPER_TAIL_BYTES
+    start = max(0, size - ARTIFACT_WRAPPER_TAIL_BYTES)
+    with source_path.open("rb") as fh:
+        if start:
+            fh.seek(start)
+        raw = fh.read()
+    content = raw.decode("utf-8", errors="replace")
+    source_mtime = datetime.fromtimestamp(source_stat.st_mtime, timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+    truncation_note = (
+        f" &middot; showing last <b>{ARTIFACT_WRAPPER_TAIL_BYTES:,}</b> bytes"
+        f" of <b>{size:,}</b>"
+        if truncated
+        else ""
+    )
+    title = html_escape(source_path.name)
+    source_text = html_escape(str(source_path))
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>{ARTIFACT_BASE_CSS}</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>{title}</h1>
+  <div class="meta">
+    run <b>{html_escape(run_name)}</b> &middot; task <b>{html_escape(task_key)}</b> &middot;
+    source <span class="mono">{source_text}</span>
+    (<a href="{html_escape(file_href(source_path))}">open file</a>) &middot;
+    modified <b>{source_mtime}</b> &middot; size <b>{size:,}</b> bytes{truncation_note}
+  </div>
+  <pre>{html_escape(content)}</pre>
+</div>
+</body>
+</html>
+"""
+
+
+def render_status_html(
+    state: dict[str, Any],
+    renderer: ArtifactRenderer | None = None,
+    *,
+    force_wrappers: bool = False,
+) -> str:
     """Tier 0 zero-LLM live status artifact. Rendered on every state flush (~1s)."""
     run_name = html_escape(str(state.get("run_name", "ringer")))
     identity = html_escape(str(state.get("identity", "unknown")))
@@ -1120,16 +1264,29 @@ def render_status_html(state: dict[str, Any]) -> str:
     max_parallel = state.get("max_parallel", "?")
     tokens = int(totals.get("tokens", state.get("tokens", 0)) or 0)
 
-    rows = "".join(render_status_row(task) for task in tasks) or (
-        '<tr><td colspan="6" class="muted">no tasks</td></tr>'
+    rows = "".join(
+        render_status_row(task, state=state, renderer=renderer, force_wrappers=force_wrappers)
+        for task in tasks
+    ) or (
+        '<tr><td colspan="7" class="muted">no tasks</td></tr>'
     )
 
     report_note = ""
     if state.get("report_ready") and state.get("report_path"):
-        report_path = str(state["report_path"])
+        report_path = Path(str(state["report_path"]))
+        report_href = (
+            renderer.link_for_source(
+                report_path,
+                state=state,
+                task_key="run",
+                force=force_wrappers,
+            )
+            if renderer
+            else file_href(report_path)
+        )
         report_note = (
             f'<p class="meta">Final report ready: '
-            f'<a href="file://{html_escape(report_path)}">{html_escape(report_path)}</a></p>'
+            f'<a href="{html_escape(report_href)}">{html_escape(str(report_path))}</a></p>'
         )
 
     refresh = "" if state.get("finished") else '<meta http-equiv="refresh" content="5">'
@@ -1152,7 +1309,7 @@ def render_status_html(state: dict[str, Any]) -> str:
   </div>
   {report_note}
   <table>
-    <thead><tr><th>Task</th><th>Status</th><th>Attempts</th><th>Duration</th><th>Check</th><th>Spec</th></tr></thead>
+    <thead><tr><th>Task</th><th>Status</th><th>Attempts</th><th>Duration</th><th>Check</th><th>Spec</th><th>Links</th></tr></thead>
     <tbody>
       {rows}
     </tbody>
@@ -1163,7 +1320,13 @@ def render_status_html(state: dict[str, Any]) -> str:
 """
 
 
-def render_status_row(task: dict[str, Any]) -> str:
+def render_status_row(
+    task: dict[str, Any],
+    *,
+    state: dict[str, Any] | None = None,
+    renderer: ArtifactRenderer | None = None,
+    force_wrappers: bool = False,
+) -> str:
     status = str(task.get("status", "queued"))
     verdict = task.get("verdict")
     key = html_escape(str(task.get("key", "")))
@@ -1181,6 +1344,13 @@ def render_status_row(task: dict[str, Any]) -> str:
         output = html_escape(shorten(str(task.get("check_output_tail", "")), 2000))
         fail_block = f"<details><summary>check output</summary><pre>{output}</pre></details>"
 
+    links_html = render_task_links(
+        task,
+        state=state or {},
+        renderer=renderer,
+        force_wrappers=force_wrappers,
+    )
+
     return f"""<tr>
       <td class="mono">{key}</td>
       <td><span class="chip" style="background:{color}">{html_escape(label)}</span></td>
@@ -1188,10 +1358,16 @@ def render_status_row(task: dict[str, Any]) -> str:
       <td class="mono">{elapsed}</td>
       <td class="mono">rc={check_rc_text}<br>{check_cmd}</td>
       <td class="spec">{spec_preview}{fail_block}</td>
+      <td class="mono">{links_html}</td>
     </tr>"""
 
 
-def render_final_report_html(state: dict[str, Any]) -> str:
+def render_final_report_html(
+    state: dict[str, Any],
+    renderer: ArtifactRenderer | None = None,
+    *,
+    force_wrappers: bool = True,
+) -> str:
     """Feature 4: self-contained final report, rendered once when a run finishes."""
     run_name = html_escape(str(state.get("run_name", "ringer")))
     identity = html_escape(str(state.get("identity", "unknown")))
@@ -1208,7 +1384,10 @@ def render_final_report_html(state: dict[str, Any]) -> str:
     overall_color = status_color("pass" if fail_n == 0 else "fail")
     run_id = html_escape(str(state.get("run_id", "")))
 
-    rows = "".join(render_report_row(task) for task in tasks) or (
+    rows = "".join(
+        render_report_row(task, state=state, renderer=renderer, force_wrappers=force_wrappers)
+        for task in tasks
+    ) or (
         '<tr><td colspan="8" class="muted">no tasks</td></tr>'
     )
 
@@ -1247,7 +1426,13 @@ def render_final_report_html(state: dict[str, Any]) -> str:
 """
 
 
-def render_report_row(task: dict[str, Any]) -> str:
+def render_report_row(
+    task: dict[str, Any],
+    *,
+    state: dict[str, Any] | None = None,
+    renderer: ArtifactRenderer | None = None,
+    force_wrappers: bool = False,
+) -> str:
     status = str(task.get("status", "queued"))
     verdict = str(task.get("verdict") or status.upper())
     color = status_color(status)
@@ -1268,32 +1453,12 @@ def render_report_row(task: dict[str, Any]) -> str:
         else ""
     )
 
-    links: list[str] = []
-    taskdir_path: Path | None = None
-    taskdir = task.get("taskdir")
-    if taskdir:
-        taskdir_path = Path(str(taskdir))
-        if taskdir_path.exists():
-            links.append(f'<a href="file://{html_escape(str(taskdir_path))}">taskdir</a>')
-
-    log_path = task.get("log_path")
-    worker_log = Path(str(log_path)) if log_path else None
-    if worker_log is None and taskdir_path is not None:
-        worker_log = taskdir_path / "worker.log"
-    if worker_log is not None and worker_log.exists():
-        links.append(f'<a href="file://{html_escape(str(worker_log))}">worker.log</a>')
-
-    report_paths = task.get("report_paths") or {}
-    if not isinstance(report_paths, dict):
-        report_paths = {}
-    for report_name in TASK_REPORT_FILENAMES:
-        report_value = report_paths.get(report_name)
-        report_file = Path(str(report_value)) if report_value else None
-        if report_file is None and taskdir_path is not None:
-            report_file = taskdir_path / report_name
-        if report_file is not None and report_file.exists():
-            links.append(f'<a href="file://{html_escape(str(report_file))}">{report_name}</a>')
-    links_html = " &middot; ".join(links) if links else '<span class="muted">—</span>'
+    links_html = render_task_links(
+        task,
+        state=state or {},
+        renderer=renderer,
+        force_wrappers=force_wrappers,
+    )
 
     return f"""<tr>
       <td class="mono">{key}</td>
@@ -1307,7 +1472,70 @@ def render_report_row(task: dict[str, Any]) -> str:
     </tr>"""
 
 
-def render_artifact_index_html(entries: list[dict[str, Any]]) -> str:
+def render_task_links(
+    task: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    renderer: ArtifactRenderer | None = None,
+    force_wrappers: bool = False,
+) -> str:
+    links: list[str] = []
+    taskdir_path: Path | None = None
+    taskdir = task.get("taskdir")
+    if taskdir:
+        taskdir_path = Path(str(taskdir))
+        if taskdir_path.exists():
+            links.append(f'<a href="{html_escape(file_href(taskdir_path))}">taskdir</a>')
+
+    task_key = str(task.get("key", "task"))
+
+    log_path = task.get("log_path")
+    worker_log = Path(str(log_path)) if log_path else None
+    if worker_log is None and taskdir_path is not None:
+        worker_log = taskdir_path / "worker.log"
+    if worker_log is not None and worker_log.exists():
+        href = (
+            renderer.link_for_source(
+                worker_log,
+                state=state,
+                task_key=task_key,
+                force=force_wrappers,
+            )
+            if renderer
+            else file_href(worker_log)
+        )
+        links.append(f'<a href="{html_escape(href)}">worker.log</a>')
+
+    report_paths = task.get("report_paths") or {}
+    if not isinstance(report_paths, dict):
+        report_paths = {}
+    for report_name in TASK_REPORT_FILENAMES:
+        report_value = report_paths.get(report_name)
+        report_file = Path(str(report_value)) if report_value else None
+        if report_file is None and taskdir_path is not None:
+            report_file = taskdir_path / report_name
+        if report_file is not None and report_file.exists():
+            href = (
+                renderer.link_for_source(
+                    report_file,
+                    state=state,
+                    task_key=task_key,
+                    force=force_wrappers,
+                )
+                if renderer
+                else file_href(report_file)
+            )
+            links.append(f'<a href="{html_escape(href)}">{report_name}</a>')
+
+    return " &middot; ".join(links) if links else '<span class="muted">—</span>'
+
+
+def render_artifact_index_html(
+    entries: list[dict[str, Any]],
+    renderer: ArtifactRenderer | None = None,
+    *,
+    force_wrappers: bool = False,
+) -> str:
     """Multi-run index: one pane of glass across every run under this state_dir."""
     rows = []
     for entry in entries:
@@ -1321,9 +1549,21 @@ def render_artifact_index_html(entries: list[dict[str, Any]]) -> str:
         links: list[str] = []
         artifact_path = entry.get("artifact_path")
         if artifact_path:
-            links.append(f'<a href="file://{html_escape(str(artifact_path))}">live</a>')
+            links.append(f'<a href="{html_escape(file_href(Path(str(artifact_path))))}">live</a>')
         if entry.get("report_ready") and entry.get("report_path"):
-            links.append(f'<a href="file://{html_escape(str(entry["report_path"]))}">report</a>')
+            report_path = Path(str(entry["report_path"]))
+            href = (
+                renderer.link_for_source(
+                    report_path,
+                    run_id=str(entry.get("run_id") or "run"),
+                    run_name=str(entry.get("run_name") or "ringer"),
+                    task_key="run",
+                    force=force_wrappers,
+                )
+                if renderer
+                else file_href(report_path)
+            )
+            links.append(f'<a href="{html_escape(href)}">report</a>')
         links_html = " &middot; ".join(links) if links else '<span class="muted">—</span>'
         rows.append(
             f"""<tr>
