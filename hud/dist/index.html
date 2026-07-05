@@ -1,0 +1,1577 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ringside mission control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080a0f;
+      --panel: #111722;
+      --panel-2: #151d2b;
+      --line: rgba(255,255,255,.12);
+      --text: #eef4ff;
+      --muted: #8f9db2;
+      --cyan: #28d7ff;
+      --amber: #ffbe45;
+      --green: #49e27d;
+      --red: #ff5468;
+      --gray: #778195;
+      --accent: #28d7ff;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      background:
+        radial-gradient(circle at 50% -20%, rgba(40,215,255,.14), transparent 28rem),
+        linear-gradient(180deg, #080a0f 0%, #0d1119 60%, #080a0f 100%);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow: hidden;
+    }
+    body:before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: linear-gradient(180deg, rgba(0,0,0,.86), transparent);
+    }
+    .shell {
+      position: relative;
+      z-index: 1;
+      width: 100%;
+      height: 100vh;
+      min-height: 0;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      background: rgba(8,10,15,.72);
+    }
+    .topbar {
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .top-dot {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--gray);
+      box-shadow: 0 0 16px rgba(119,129,149,.7);
+    }
+    .top-dot.live {
+      background: var(--accent);
+      animation: dotPulse 1.35s infinite;
+    }
+    .top-dot.pass { background: var(--green); box-shadow: 0 0 18px rgba(73,226,125,.72); }
+    .top-dot.fail { background: var(--red); box-shadow: 0 0 18px rgba(255,84,104,.78); }
+    .title {
+      min-width: 0;
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+    h1 {
+      margin: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 16px;
+      line-height: 1;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+    .subtitle, .counts, .clock {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+    .counts { color: #cbd6e8; }
+    .hud-close {
+      width: 24px;
+      height: 24px;
+      display: inline-grid;
+      place-items: center;
+      padding: 0;
+      border: 0;
+      border-radius: 50%;
+      background: transparent;
+      color: #cbd6e8;
+      font: 700 18px/1 system-ui, sans-serif;
+      cursor: pointer;
+    }
+    .hud-close:hover,
+    .hud-close:focus-visible {
+      background: rgba(255,84,104,.18);
+      color: #fff;
+      outline: none;
+    }
+    .toolbar {
+      flex: 0 0 auto;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      position: relative;
+    }
+    .toolbar-group { display: flex; align-items: center; gap: 4px; }
+    .toolbar-spacer { flex: 1 1 auto; }
+    .toolbar button, .toolbar select, .toolbar input[type="search"] {
+      background: rgba(255,255,255,.045);
+      border: 1px solid var(--line);
+      color: var(--text);
+      font: 700 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      border-radius: 6px;
+      padding: 5px 8px;
+    }
+    .toolbar button { cursor: pointer; }
+    .toolbar button:hover, .toolbar select:hover {
+      border-color: color-mix(in srgb, var(--accent) 60%, var(--line));
+    }
+    .toolbar button:disabled {
+      cursor: not-allowed;
+      opacity: .48;
+    }
+    .toolbar button.active {
+      background: color-mix(in srgb, var(--accent) 24%, transparent);
+      border-color: var(--accent);
+      color: #eef8ff;
+    }
+    .toolbar input[type="search"] {
+      min-width: 160px;
+      flex: 0 1 240px;
+      font-weight: 500;
+    }
+    .toolbar input[type="search"]::placeholder { color: var(--muted); }
+    .settings-panel {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 12px;
+      z-index: 40;
+      width: 264px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 18px 40px rgba(0,0,0,.5);
+      padding: 12px;
+      display: none;
+      flex-direction: column;
+      gap: 9px;
+    }
+    .settings-panel.open { display: flex; }
+    .settings-title {
+      font-size: 9.5px;
+      text-transform: uppercase;
+      letter-spacing: .07em;
+      color: var(--muted);
+      margin: 3px 0 -3px;
+    }
+    .settings-title:first-child { margin-top: 0; }
+    .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 11.5px; }
+    .settings-row label { color: var(--text); min-width: 0; }
+    .settings-panel input[type="color"] { width: 34px; height: 22px; padding: 0; border: none; background: none; cursor: pointer; }
+    .settings-panel select {
+      background: rgba(255,255,255,.05);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 3px 6px;
+      font-size: 11px;
+    }
+    #app {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 10px 12px 12px;
+    }
+    .empty {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: grid;
+      place-items: center;
+      color: rgba(230,240,255,.72);
+      font-size: 13px;
+      animation: emptyPulse 1.8s ease-in-out infinite;
+    }
+    .run {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: linear-gradient(180deg, rgba(21,29,43,.92), rgba(11,15,23,.96));
+      overflow: hidden;
+      transition: opacity .2s ease, border-color .2s ease, box-shadow .2s ease;
+    }
+    .run.live {
+      border-color: rgba(40,215,255,.42);
+      box-shadow: 0 0 34px rgba(40,215,255,.10);
+    }
+    .run.finished { opacity: .82; }
+    .run.died {
+      border-color: rgba(255,84,104,.58);
+      background: linear-gradient(180deg, rgba(46,18,25,.92), rgba(14,10,14,.96));
+    }
+    .run-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 10px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      min-width: 0;
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      flex: 0 0 9px;
+      border-radius: 50%;
+      background: var(--gray);
+      box-shadow: 0 0 16px rgba(119,129,149,.7);
+    }
+    .dot.live {
+      background: var(--accent);
+      animation: dotPulse 1.35s infinite;
+    }
+    .dot.finished { background: var(--green); }
+    .dot.died { background: var(--red); box-shadow: 0 0 18px rgba(255,84,104,.78); }
+    .run-main {
+      min-width: 0;
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      flex: 1 1 auto;
+    }
+    .run-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+    .identity {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10.5px;
+      font-weight: 700;
+    }
+    .run-meta {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      color: #cbd6e8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10.5px;
+      line-height: 1.18;
+      white-space: nowrap;
+    }
+    .final { color: var(--muted); }
+    .tasks {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      align-items: start;
+      gap: 8px;
+      padding: 10px;
+    }
+    .task {
+      min-width: 0;
+      min-height: 76px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px 8px;
+      align-content: start;
+      border: 1px solid rgba(255,255,255,.09);
+      border-left: 3px solid var(--gray);
+      border-radius: 7px;
+      background: rgba(255,255,255,.035);
+      padding: 8px;
+      cursor: pointer;
+    }
+    .task:hover,
+    .task.selected {
+      border-color: rgba(255,255,255,.18);
+      background: rgba(255,255,255,.055);
+    }
+    .task.running, .task.retrying { border-left-color: var(--accent); }
+    .task.verifying { border-left-color: var(--amber); }
+    .task.pass { border-left-color: var(--green); }
+    .task.fail { border-left-color: var(--red); }
+    .task-key {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .task-status {
+      border-radius: 999px;
+      padding: 3px 6px;
+      background: var(--gray);
+      color: #080a0f;
+      font-size: 9px;
+      font-weight: 900;
+      text-transform: uppercase;
+      line-height: 1;
+    }
+    .task.running .task-status, .task.retrying .task-status { background: var(--accent); }
+    .task.verifying .task-status { background: var(--amber); }
+    .task.pass .task-status { background: var(--green); }
+    .task.fail .task-status { background: var(--red); }
+    .task-activity, .task-meta {
+      grid-column: 1 / -1;
+      min-width: 0;
+    }
+    .task-activity {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #cbd6e8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10.5px;
+      line-height: 1.25;
+    }
+    .task-meta {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10.5px;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .task-elapsed, .task-tokens, .children {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .children {
+      color: #b9f3ff;
+      font-weight: 800;
+    }
+    .task-drawer {
+      grid-column: 1 / -1;
+      padding: 9px 2px 12px;
+      border-top: 1px solid rgba(255,255,255,.10);
+      color: #b8c4d6;
+      font-size: 11px;
+    }
+    .drawer-spec {
+      margin: 0 0 8px;
+      max-width: 96ch;
+      color: #d8e3f3;
+      line-height: 1.45;
+    }
+    .drawer-meta,
+    .drawer-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10.5px;
+    }
+    .drawer-links a {
+      color: #b9f3ff;
+      text-decoration: none;
+    }
+    .drawer-links a:hover { text-decoration: underline; }
+    .drawer-label {
+      margin: 10px 0 4px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .task-drawer pre {
+      width: 100%;
+      margin: 0;
+      padding: 8px;
+      overflow: auto;
+      background: rgba(0,0,0,.34);
+      border: 0;
+      border-radius: 5px;
+      color: #e5eefb;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10.5px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .task-drawer .output-tail { max-height: 40vh; }
+    #app.artifact-mode { display: none; }
+    .artifact-view {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      padding: 8px 12px 12px;
+    }
+    .artifact-view.active { display: flex; }
+    .artifact-tabs {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 4px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .artifact-tab {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 260px;
+      padding: 5px 8px;
+      border: 0;
+      border-radius: 5px;
+      background: transparent;
+      color: var(--muted);
+      font: 700 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      cursor: pointer;
+    }
+    .artifact-tab.active {
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+    }
+    .artifact-tab .tab-dot {
+      width: 7px;
+      height: 7px;
+      flex: 0 0 7px;
+      border-radius: 50%;
+      background: var(--green);
+    }
+    .artifact-tab.live .tab-dot {
+      background: var(--accent);
+      box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 80%, transparent);
+    }
+    .artifact-tab span:last-child {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .artifact-frame-wrap {
+      flex: 1 1 auto;
+      min-height: 0;
+      width: 100%;
+      overflow: hidden;
+      background: #05070a;
+    }
+    .artifact-frame-wrap iframe {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      border: 0;
+      display: block;
+      background: #05070a;
+    }
+    .artifact-empty {
+      height: 100%;
+      min-height: 220px;
+      display: grid;
+      place-items: center;
+      padding: 26px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+    .run.collapsed .tasks { display: none; }
+    body.density-compact .toolbar { padding-top: 6px; padding-bottom: 6px; }
+    body.density-compact .tasks { gap: 6px; padding: 7px; }
+    body.density-compact .task { min-height: 64px; padding: 6px; gap: 4px 6px; }
+    body.density-compact .task-key { font-size: 11.5px; }
+    body.density-compact .task-activity,
+    body.density-compact .task-meta,
+    body.density-compact .task-drawer pre { font-size: 10px; }
+    body.density-compact .run-head { padding: 7px 9px; }
+    body.hide-activity .task-activity { display: none !important; }
+    body.hide-children .children { display: none !important; }
+    body.hide-tokens .run-tokens,
+    body.hide-tokens .task-tokens { display: none !important; }
+    @keyframes dotPulse {
+      0% { box-shadow: 0 0 0 0 rgba(40,215,255,.62), 0 0 24px rgba(40,215,255,.86); }
+      70% { box-shadow: 0 0 0 12px rgba(40,215,255,0), 0 0 24px rgba(40,215,255,.86); }
+      100% { box-shadow: 0 0 0 0 rgba(40,215,255,0), 0 0 24px rgba(40,215,255,.86); }
+    }
+    @keyframes emptyPulse {
+      0%, 100% { opacity: .38; transform: scale(.985); }
+      50% { opacity: .90; transform: scale(1); }
+    }
+    @media (max-width: 640px) {
+      .topbar {
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        gap: 8px;
+      }
+      .title {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 3px;
+      }
+      .clock { display: none; }
+      .toolbar input[type="search"] { flex: 1 1 100%; }
+      .tasks { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <span id="topDot" class="top-dot"></span>
+      <div class="title">
+        <h1 id="headline">Ringside mission control</h1>
+        <div id="subtitle" class="subtitle">no ringers running</div>
+        <div id="runCounts" class="counts">0 ringers · 0 agents</div>
+      </div>
+      <div id="clock" class="clock">00:00</div>
+      <button type="button" id="hudClose" class="hud-close" title="Collapse" aria-label="Collapse" data-no-drag>×</button>
+    </header>
+    <div class="toolbar" id="toolbar" data-no-drag>
+      <div class="toolbar-group" id="viewButtons">
+        <button type="button" data-view="grid" class="active">Grid</button>
+        <button type="button" data-view="artifact">Artifact</button>
+      </div>
+      <div class="toolbar-group">
+        <button type="button" id="collapseAllBtn">Collapse all</button>
+      </div>
+      <input type="search" id="agentFilter" placeholder="filter agents…">
+      <div class="toolbar-spacer"></div>
+      <button type="button" id="settingsToggle" title="Settings">&#9881;</button>
+      <div class="settings-panel" id="settingsPanel" data-no-drag>
+        <div class="settings-title">Theme</div>
+        <div class="settings-row">
+          <label for="accentInput">Accent color</label>
+          <input type="color" id="accentInput" value="#28d7ff">
+        </div>
+        <div class="settings-title">Layout</div>
+        <div class="settings-row">
+          <label for="densitySelect">Density</label>
+          <select id="densitySelect">
+            <option value="comfortable">Comfortable</option>
+            <option value="compact">Compact</option>
+          </select>
+        </div>
+        <div class="settings-row">
+          <label for="defaultViewSelect">Default view</label>
+          <select id="defaultViewSelect">
+            <option value="grid">Grid</option>
+            <option value="artifact">Artifact</option>
+          </select>
+        </div>
+        <div class="settings-title">Show fields</div>
+        <div class="settings-row">
+          <label for="showActivity">Activity line</label>
+          <input type="checkbox" id="showActivity" checked>
+        </div>
+        <div class="settings-row">
+          <label for="showChildren">Child process count</label>
+          <input type="checkbox" id="showChildren" checked>
+        </div>
+        <div class="settings-row">
+          <label for="showTokens">Run token totals</label>
+          <input type="checkbox" id="showTokens" checked>
+        </div>
+      </div>
+    </div>
+    <main id="app"><div class="empty">no ringers running</div></main>
+    <div class="artifact-view" id="artifactView">
+      <div class="artifact-tabs" id="artifactTabs" data-no-drag></div>
+      <div class="artifact-frame-wrap" id="artifactFrameWrap">
+        <div class="artifact-empty">no artifact available yet</div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const app = document.getElementById("app");
+    const headline = document.getElementById("headline");
+    const subtitle = document.getElementById("subtitle");
+    const runCounts = document.getElementById("runCounts");
+    const topDot = document.getElementById("topDot");
+    const clock = document.getElementById("clock");
+    const hudClose = document.getElementById("hudClose");
+    const toolbar = document.getElementById("toolbar");
+    const viewButtons = document.getElementById("viewButtons");
+    const collapseAllBtn = document.getElementById("collapseAllBtn");
+    const agentFilterInput = document.getElementById("agentFilter");
+    const settingsToggle = document.getElementById("settingsToggle");
+    const settingsPanel = document.getElementById("settingsPanel");
+    const accentInput = document.getElementById("accentInput");
+    const densitySelect = document.getElementById("densitySelect");
+    const defaultViewSelect = document.getElementById("defaultViewSelect");
+    const showActivityInput = document.getElementById("showActivity");
+    const showChildrenInput = document.getElementById("showChildren");
+    const showTokensInput = document.getElementById("showTokens");
+    const artifactView = document.getElementById("artifactView");
+    const artifactTabs = document.getElementById("artifactTabs");
+    const artifactFrameWrap = document.getElementById("artifactFrameWrap");
+
+    const ARTIFACT_REFRESH_MS = 2000;
+    const TAURI_INVOKE = window.__TAURI__?.core?.invoke;
+    const IS_TAURI = Boolean(TAURI_INVOKE);
+    const REPORT_FILE_NAMES = ["report.md", "report.html"];
+
+    let currentRuns = [];
+    const runNodes = new Map();
+    let emptyNode = app.querySelector(".empty");
+    let openTaskRef = null;
+    let viewMode = "grid";
+    let collapseAllActive = false;
+    let agentFilterText = "";
+    let selectedArtifactPathValue = null;
+    let artifactUserSelected = false;
+    let lastArtifactPath = null;
+    let displayedArtifactHtml = null;
+    let artifactRefreshTimer = null;
+    let artifactRefreshInFlight = false;
+    let artifactRefreshSeq = 0;
+
+    const DEFAULT_SETTINGS = {
+      version: 1,
+      theme: {accent: "#28d7ff"},
+      density: "comfortable",
+      columns: {showActivity: true, showChildren: true, showTokens: true},
+      layout: {defaultView: "grid"},
+    };
+    let settings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+    let settingsSaveTimer = null;
+
+    function setText(node, value) {
+      if (!node) return;
+      const text = String(value ?? "");
+      if (node.textContent !== text) node.textContent = text;
+    }
+
+    function setTitle(node, value) {
+      if (!node) return;
+      const text = String(value ?? "");
+      if (node.title !== text) node.title = text;
+    }
+
+    function setHidden(node, hidden) {
+      if (node && node.hidden !== hidden) node.hidden = hidden;
+    }
+
+    function safeClass(value, fallback) {
+      const className = String(value || fallback || "unknown")
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+      return className || fallback || "unknown";
+    }
+
+    function setStateClass(node, baseClass, state) {
+      const nextClass = `${baseClass} ${safeClass(state, "unknown")}`;
+      if (node.className !== nextClass) node.className = nextClass;
+    }
+
+    function numberOrZero(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : 0;
+    }
+
+    function plural(count, singular, pluralName) {
+      return `${count} ${count === 1 ? singular : pluralName}`;
+    }
+
+    function formatTokens(value) {
+      return `${numberOrZero(value).toLocaleString()} tok`;
+    }
+
+    function fmtElapsed(seconds) {
+      seconds = Math.max(0, Math.floor(seconds || 0));
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+      return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    }
+
+    function runTimestamp(run) {
+      const modified = Number(run?.mtime);
+      if (Number.isFinite(modified)) return modified * 1000;
+      const started = Date.parse(run?.started_at || "");
+      return Number.isFinite(started) ? started : 0;
+    }
+
+    function formatStartedTime(run) {
+      const timestamp = runTimestamp(run);
+      if (!timestamp) return "unknown";
+      return new Date(timestamp).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+    }
+
+    function elapsedFromStart(run) {
+      const current = Number(run.elapsed_s);
+      if (run.state && run.state !== "live" && Number.isFinite(current)) return current;
+      if (!run.started_at) return 0;
+      const started = Date.parse(run.started_at);
+      if (!Number.isFinite(started)) return Number.isFinite(current) ? current : 0;
+      return Math.max(Number.isFinite(current) ? current : 0, (Date.now() - started) / 1000);
+    }
+
+    function normalizePayload(payload) {
+      const rawRuns = Array.isArray(payload) ? payload : (payload?.runs || [payload]);
+      return rawRuns.filter(Boolean).map(run => {
+        const totals = run.totals || {};
+        const summary = run.summary || {};
+        const state = run.state || (run.finished ? "finished" : "live");
+        const pass = numberOrZero(run.pass ?? summary.pass ?? totals.pass ?? 0);
+        const fail = numberOrZero(run.fail ?? summary.fail ?? totals.fail ?? 0);
+        const tokens = numberOrZero(run.tokens ?? summary.tokens ?? totals.tokens ?? 0);
+        return {
+          ...run,
+          state,
+          identity: run.identity || "unknown",
+          run_name: run.run_name || "ringer",
+          elapsed_s: elapsedFromStart(run),
+          pass,
+          fail,
+          tokens,
+          tasks: Array.isArray(run.tasks) ? run.tasks : []
+        };
+      }).sort((left, right) => {
+        const rank = {live: 0, finished: 1, died: 2};
+        const leftRank = rank[left.state] ?? 3;
+        const rightRank = rank[right.state] ?? 3;
+        if (leftRank !== rightRank) return leftRank - rightRank;
+        return runTimestamp(right) - runTimestamp(left);
+      });
+    }
+
+    function createEmptyNode() {
+      const node = document.createElement("div");
+      node.className = "empty";
+      node.textContent = "no ringers running";
+      return node;
+    }
+
+    function runKey(run, index) {
+      const direct = run.run_id ?? run.id;
+      if (direct) return String(direct);
+      const parts = [run.identity, run.run_name, run.started_at, run.pid, run.port, run.artifact_path]
+        .filter(value => value !== undefined && value !== null && value !== "");
+      return parts.length > 0 ? parts.map(String).join("|") : `run-${index}`;
+    }
+
+    function taskKey(task, index) {
+      return String(task.__taskKey || task.key || task.id || task.name || `task-${index}`);
+    }
+
+    function taskTailText(task) {
+      const tail = Array.isArray(task.log_tail)
+        ? task.log_tail
+        : (task.log_tail ? [task.log_tail] : []);
+      return tail.map(line => String(line).trim()).filter(Boolean).join(" / ");
+    }
+
+    function taskActivityText(task, status, tail) {
+      const activity = String(task.activity || "").trim() || tail || status;
+      return `> ${activity}`;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function pathBaseName(path) {
+      return String(path || "").split(/[\\/]/).filter(Boolean).pop() || "";
+    }
+
+    function pathDirName(path) {
+      const text = String(path || "");
+      const index = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"));
+      return index > 0 ? text.slice(0, index) : "";
+    }
+
+    function stripHtmlExtension(path) {
+      return pathBaseName(path).replace(/\.html?$/i, "");
+    }
+
+    function sanitizeArtifactName(value) {
+      const sanitized = String(value || "artifact").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "");
+      return sanitized || "artifact";
+    }
+
+    function fileHref(path) {
+      const text = String(path || "").trim();
+      if (!text) return "";
+      if (/^(?:file|https?):/i.test(text)) return text;
+      return `file://${encodeURI(text).replace(/#/g, "%23")}`;
+    }
+
+    function artifactWrapperHref(run, task, sourcePath) {
+      if (!run?.artifact_path || !sourcePath) return "";
+      const artifactDir = pathDirName(run.artifact_path);
+      if (!artifactDir) return "";
+      const runId = run.run_id || run.id || stripHtmlExtension(run.artifact_path);
+      const key = task?.key || task?.id || task?.name || "task";
+      const sourceName = pathBaseName(sourcePath);
+      if (!sourceName) return "";
+      const wrapperPath = `${artifactDir}/view/${sanitizeArtifactName(runId)}/${sanitizeArtifactName(key)}--${sanitizeArtifactName(sourceName)}.html`;
+      return fileHref(wrapperPath);
+    }
+
+    function linkHtml(href, label) {
+      if (!href) return "";
+      return `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`;
+    }
+
+    function taskLinksHtml(run, task) {
+      const links = [];
+      if (task.taskdir) links.push(linkHtml(fileHref(task.taskdir), "taskdir"));
+
+      const logPath = task.log_path || (task.taskdir ? `${task.taskdir}/worker.log` : "");
+      if (logPath) {
+        links.push(linkHtml(artifactWrapperHref(run, task, logPath) || fileHref(logPath), "worker.log"));
+      }
+
+      const reportPaths = task.report_paths && typeof task.report_paths === "object" ? task.report_paths : {};
+      for (const name of REPORT_FILE_NAMES) {
+        const reportPath = reportPaths[name];
+        if (reportPath) {
+          links.push(linkHtml(artifactWrapperHref(run, task, reportPath) || fileHref(reportPath), name));
+        }
+      }
+      return links.filter(Boolean).join(" ");
+    }
+
+    function createRunRecord(key) {
+      const node = document.createElement("section");
+      node.className = "run";
+      node.setAttribute("data-run-id", key);
+
+      const head = document.createElement("header");
+      head.className = "run-head";
+
+      const dot = document.createElement("span");
+      dot.className = "dot";
+
+      const main = document.createElement("div");
+      main.className = "run-main";
+
+      const name = document.createElement("div");
+      name.className = "run-name";
+
+      const identity = document.createElement("span");
+      identity.className = "identity";
+
+      const meta = document.createElement("div");
+      meta.className = "run-meta";
+
+      const elapsed = document.createElement("span");
+      elapsed.className = "run-elapsed";
+
+      const tokens = document.createElement("span");
+      tokens.className = "run-tokens";
+
+      const final = document.createElement("span");
+      final.className = "final";
+
+      const tasks = document.createElement("div");
+      tasks.className = "tasks";
+
+      const drawer = document.createElement("div");
+      drawer.className = "task-drawer";
+      drawer.hidden = true;
+
+      main.append(name, identity);
+      meta.append(elapsed, tokens, final);
+      head.append(dot, main, meta);
+      node.append(head, tasks);
+
+      return {
+        key,
+        node,
+        run: null,
+        tasks: new Map(),
+        elements: {dot, name, identity, elapsed, tokens, final, tasks, drawer}
+      };
+    }
+
+    function createTaskRecord(key, runRecord) {
+      const node = document.createElement("div");
+      node.className = "task";
+      node.setAttribute("data-task-key", key);
+
+      const name = document.createElement("div");
+      name.className = "task-key";
+
+      const status = document.createElement("div");
+      status.className = "task-status";
+
+      const activity = document.createElement("div");
+      activity.className = "task-activity";
+
+      const meta = document.createElement("div");
+      meta.className = "task-meta";
+
+      const elapsed = document.createElement("div");
+      elapsed.className = "task-elapsed";
+
+      const tokens = document.createElement("div");
+      tokens.className = "task-tokens";
+
+      const children = document.createElement("div");
+      children.className = "children";
+
+      meta.append(elapsed, tokens, children);
+      node.append(name, status, meta, activity);
+
+      node.addEventListener("click", event => {
+        if (event.target.closest("a, button, input, select, textarea")) return;
+        if (key === "__empty__") return;
+        toggleTaskDrawer(runRecord, key);
+      });
+
+      return {
+        key,
+        node,
+        task: null,
+        runRecord,
+        elements: {name, status, activity, elapsed, tokens, children},
+      };
+    }
+
+    function updateTaskRecord(record, task, run, runRecord) {
+      const status = task.status || "queued";
+      const tail = taskTailText(task);
+      const tokens = numberOrZero(task.tokens);
+      const children = numberOrZero(task.children);
+      const name = task.key || "task";
+      const title = task.engine ? `${name} / ${task.engine}` : name;
+      const activity = taskActivityText(task, status, tail);
+      const selected = openTaskRef?.runKey === runRecord.key && openTaskRef?.taskKey === record.key;
+      const taskClass = `task ${safeClass(status, "queued")}${selected ? " selected" : ""}`;
+
+      record.task = task;
+      record.runRecord = runRecord;
+      if (record.node.className !== taskClass) record.node.className = taskClass;
+      setText(record.elements.name, name);
+      setTitle(record.elements.name, title);
+      setText(record.elements.status, status);
+      setText(record.elements.activity, activity);
+      setTitle(record.elements.activity, activity);
+      setText(record.elements.elapsed, fmtElapsed(task.elapsed_s));
+      setText(record.elements.tokens, formatTokens(tokens));
+      setText(record.elements.children, children > 0 ? `p${children}` : "");
+
+      if (selected) updateDrawerContent(runRecord, run, task);
+    }
+
+    function updateDrawerContent(runRecord, run, task) {
+      const drawer = runRecord.elements.drawer;
+      const attempts = numberOrZero(task.attempts);
+      const rc = task.check_returncode === null || task.check_returncode === undefined ? "pending" : String(task.check_returncode);
+      const timedOut = task.check_timed_out ? " timeout" : "";
+      const verdict = task.verdict ? ` ${task.verdict}` : "";
+      const spec = String(task.spec || task.spec_short || "").trim() || "No spec preview recorded.";
+      const check = String(task.check || "").trim() || "No check command recorded.";
+      const checkOutput = String(task.check_output_tail || "").trim() || "No check output recorded yet.";
+      const links = taskLinksHtml(run, task) || `<span>no files linked</span>`;
+      const meta = [
+        `attempts ${attempts}`,
+        `engine ${task.engine || "unknown"}`,
+        `rc ${rc}${timedOut}${verdict}`,
+      ].map(escapeHtml).join(" · ");
+
+      const html = [
+        `<p class="drawer-spec">${escapeHtml(spec)}</p>`,
+        `<div class="drawer-meta">${meta}</div>`,
+        `<div class="drawer-links">${links}</div>`,
+        `<div class="drawer-label">Check command</div>`,
+        `<pre>${escapeHtml(check)}</pre>`,
+        `<div class="drawer-label">Check output tail</div>`,
+        `<pre class="output-tail">${escapeHtml(checkOutput)}</pre>`,
+      ].join("");
+      if (drawer.innerHTML !== html) drawer.innerHTML = html;
+    }
+
+    function closeTaskDrawer() {
+      if (!openTaskRef) return;
+      const runRecord = runNodes.get(openTaskRef.runKey);
+      const taskRecord = runRecord?.tasks.get(openTaskRef.taskKey);
+      taskRecord?.node.classList.remove("selected");
+      if (runRecord?.elements.drawer.isConnected) runRecord.elements.drawer.remove();
+      if (runRecord) runRecord.elements.drawer.hidden = true;
+      openTaskRef = null;
+    }
+
+    function toggleTaskDrawer(runRecord, taskKeyValue) {
+      if (openTaskRef?.runKey === runRecord.key && openTaskRef?.taskKey === taskKeyValue) {
+        closeTaskDrawer();
+        return;
+      }
+      closeTaskDrawer();
+      openTaskRef = {runKey: runRecord.key, taskKey: taskKeyValue};
+      renderOpenDrawer();
+    }
+
+    function placeDrawerAfterRow(runRecord, cardNode) {
+      const tasks = runRecord.elements.tasks;
+      const drawer = runRecord.elements.drawer;
+      if (!cardNode?.isConnected || runRecord.node.classList.contains("collapsed")) return;
+      drawer.hidden = false;
+      if (!drawer.isConnected) tasks.appendChild(drawer);
+
+      const targetTop = cardNode.getBoundingClientRect().top;
+      let lastInRow = cardNode;
+      for (const node of tasks.querySelectorAll(".task")) {
+        if (node.hidden) continue;
+        const top = node.getBoundingClientRect().top;
+        if (Math.abs(top - targetTop) < 3) lastInRow = node;
+      }
+      lastInRow.after(drawer);
+    }
+
+    function renderOpenDrawer() {
+      if (!openTaskRef) return;
+      const runRecord = runNodes.get(openTaskRef.runKey);
+      const taskRecord = runRecord?.tasks.get(openTaskRef.taskKey);
+      if (!runRecord || !taskRecord || !taskRecord.task) {
+        closeTaskDrawer();
+        return;
+      }
+      for (const [, record] of runRecord.tasks) record.node.classList.toggle("selected", record === taskRecord);
+      updateDrawerContent(runRecord, runRecord.run, taskRecord.task);
+      placeDrawerAfterRow(runRecord, taskRecord.node);
+    }
+
+    function updateRunRecord(record, run) {
+      const identity = run.identity || "unknown";
+      const name = run.run_name || "ringer";
+      const final = run.state === "live"
+        ? `ok ${run.pass} fail ${run.fail}`
+        : (run.state === "died" ? `died · ok ${run.pass} fail ${run.fail}` : `ok ${run.pass} fail ${run.fail}`);
+
+      record.run = run;
+      setStateClass(record.node, "run", run.state);
+      record.node.classList.toggle("collapsed", collapseAllActive);
+      setStateClass(record.elements.dot, "dot", run.state);
+      setText(record.elements.name, name);
+      setTitle(record.elements.name, name);
+      setText(record.elements.identity, identity);
+      setTitle(record.elements.identity, identity);
+      setText(record.elements.elapsed, fmtElapsed(run.elapsed_s));
+      setText(record.elements.tokens, formatTokens(run.tokens));
+      setText(record.elements.final, final);
+      syncTaskNodes(record, run.tasks, run);
+    }
+
+    function reconcileOrder(parent, nodes) {
+      let cursor = parent.firstElementChild;
+      for (const node of nodes) {
+        if (node === cursor) {
+          cursor = cursor.nextElementSibling;
+        } else {
+          parent.insertBefore(node, cursor);
+        }
+      }
+    }
+
+    function syncTaskNodes(runRecord, tasks, run) {
+      const displayTasks = tasks.length > 0
+        ? tasks
+        : [{__taskKey: "__empty__", key: "no tasks", status: "idle", elapsed_s: 0, tokens: 0}];
+      const seen = new Set();
+      const orderedNodes = [];
+
+      displayTasks.forEach((task, index) => {
+        const key = taskKey(task, index);
+        let record = runRecord.tasks.get(key);
+        if (!record) {
+          record = createTaskRecord(key, runRecord);
+          runRecord.tasks.set(key, record);
+        }
+        seen.add(key);
+        updateTaskRecord(record, task, run, runRecord);
+        orderedNodes.push(record.node);
+      });
+
+      for (const [key, record] of runRecord.tasks) {
+        if (!seen.has(key)) {
+          if (openTaskRef?.runKey === runRecord.key && openTaskRef?.taskKey === key) closeTaskDrawer();
+          record.node.remove();
+          runRecord.tasks.delete(key);
+        }
+      }
+
+      reconcileOrder(runRecord.elements.tasks, orderedNodes);
+      if (openTaskRef?.runKey === runRecord.key) requestAnimationFrame(renderOpenDrawer);
+    }
+
+    function syncRunNodes(runs) {
+      if (runs.length === 0) {
+        closeTaskDrawer();
+        for (const [, record] of runNodes) record.node.remove();
+        runNodes.clear();
+        if (!emptyNode) emptyNode = createEmptyNode();
+        if (app.firstElementChild !== emptyNode || app.childElementCount !== 1) {
+          app.replaceChildren(emptyNode);
+        }
+        return;
+      }
+
+      if (emptyNode?.isConnected) emptyNode.remove();
+
+      const seen = new Set();
+      const orderedNodes = [];
+      runs.forEach((run, index) => {
+        const key = runKey(run, index);
+        let record = runNodes.get(key);
+        if (!record) {
+          record = createRunRecord(key);
+          runNodes.set(key, record);
+        }
+        seen.add(key);
+        updateRunRecord(record, run);
+        orderedNodes.push(record.node);
+      });
+
+      for (const [key, record] of runNodes) {
+        if (!seen.has(key)) {
+          if (openTaskRef?.runKey === key) closeTaskDrawer();
+          record.node.remove();
+          runNodes.delete(key);
+        }
+      }
+
+      reconcileOrder(app, orderedNodes);
+    }
+
+    function updateTopbar(runs) {
+      const liveRuns = runs.filter(run => run.state === "live");
+      const countedRuns = liveRuns.length > 0 ? liveRuns : runs;
+      const agents = countedRuns.reduce((sum, run) => sum + (run.tasks || []).length, 0);
+      const anyFailure = runs.some(run => run.state === "died" || Number(run.fail || 0) > 0);
+      const newest = runs[0];
+      let dotClass = "";
+      if (anyFailure) dotClass = "fail";
+      else if (liveRuns.length > 0) dotClass = "live";
+      else if (newest && newest.state === "finished" && Number(newest.pass || 0) > 0) dotClass = "pass";
+      const topDotClass = `top-dot ${dotClass}`;
+      if (topDot.className !== topDotClass) topDot.className = topDotClass;
+
+      if (liveRuns.length === 1) {
+        setText(headline, liveRuns[0].run_name || "ringer");
+        setText(subtitle, liveRuns[0].identity || "unknown");
+      } else if (liveRuns.length > 1) {
+        setText(headline, "Ringside mission control");
+        setText(subtitle, "live ringers");
+      } else if (newest) {
+        setText(headline, newest.state === "died" ? `${newest.run_name || "ringer"} died` : (newest.run_name || "ringer"));
+        setText(subtitle, newest.identity || "finished");
+      } else {
+        setText(headline, "Ringside mission control");
+        setText(subtitle, "no ringers running");
+      }
+      setText(runCounts, `${plural(countedRuns.length, "ringer", "ringers")} · ${plural(agents, "agent", "agents")}`);
+      const maxElapsed = runs.reduce((max, run) => Math.max(max, Number(run.elapsed_s || 0)), 0);
+      setText(clock, fmtElapsed(maxElapsed));
+    }
+
+    function tauriInvoke(command, args) {
+      if (!TAURI_INVOKE) return Promise.reject(new Error("tauri unavailable"));
+      return TAURI_INVOKE(command, args);
+    }
+
+    function normalizeViewMode(mode) {
+      return mode === "artifact" && IS_TAURI ? "artifact" : "grid";
+    }
+
+    function configureArtifactModeAvailability() {
+      if (IS_TAURI) return;
+      const artifactButton = viewButtons?.querySelector('button[data-view="artifact"]');
+      if (artifactButton) {
+        artifactButton.disabled = true;
+        artifactButton.title = "Ringside app only";
+        artifactButton.setAttribute("aria-disabled", "true");
+      }
+      const artifactOption = defaultViewSelect?.querySelector('option[value="artifact"]');
+      if (artifactOption) {
+        artifactOption.disabled = true;
+        artifactOption.title = "Ringside app only";
+      }
+    }
+
+    function mergeSettings(base, incoming) {
+      if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
+        return JSON.parse(JSON.stringify(base));
+      }
+      return {
+        version: 1,
+        theme: {...base.theme, ...(incoming.theme || {})},
+        density: incoming.density === "compact" ? "compact" : "comfortable",
+        columns: {...base.columns, ...(incoming.columns || {})},
+        layout: {...base.layout, ...(incoming.layout || {})},
+      };
+    }
+
+    function applySettingsToDom() {
+      document.documentElement.style.setProperty("--accent", settings.theme.accent || "#28d7ff");
+      document.body.classList.toggle("density-compact", settings.density === "compact");
+      document.body.classList.toggle("hide-activity", !settings.columns.showActivity);
+      document.body.classList.toggle("hide-children", !settings.columns.showChildren);
+      document.body.classList.toggle("hide-tokens", !settings.columns.showTokens);
+    }
+
+    function applySettingsToUI() {
+      if (accentInput) accentInput.value = settings.theme.accent || "#28d7ff";
+      if (densitySelect) densitySelect.value = settings.density;
+      if (defaultViewSelect) defaultViewSelect.value = normalizeViewMode(settings.layout.defaultView);
+      if (showActivityInput) showActivityInput.checked = !!settings.columns.showActivity;
+      if (showChildrenInput) showChildrenInput.checked = !!settings.columns.showChildren;
+      if (showTokensInput) showTokensInput.checked = !!settings.columns.showTokens;
+    }
+
+    function saveSettingsDebounced() {
+      if (settingsSaveTimer) clearTimeout(settingsSaveTimer);
+      settingsSaveTimer = setTimeout(() => {
+        tauriInvoke("save_settings", {settings}).catch(() => {});
+      }, 350);
+    }
+
+    async function loadSettings() {
+      try {
+        const stored = await tauriInvoke("load_settings");
+        settings = mergeSettings(DEFAULT_SETTINGS, stored);
+      } catch (_err) {
+        settings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+      }
+      settings.layout.defaultView = normalizeViewMode(settings.layout.defaultView);
+      applySettingsToUI();
+      applySettingsToDom();
+      setViewMode(settings.layout.defaultView || "grid", {persist: false});
+    }
+
+    function setViewMode(mode, opts = {}) {
+      viewMode = normalizeViewMode(mode);
+      app.classList.toggle("artifact-mode", viewMode === "artifact");
+      artifactView.classList.toggle("active", viewMode === "artifact");
+      for (const btn of viewButtons.querySelectorAll("button[data-view]")) {
+        btn.classList.toggle("active", btn.dataset.view === viewMode);
+      }
+      if (viewMode === "artifact") {
+        syncArtifactTabs();
+        refreshArtifactView({force: true});
+        startArtifactRefreshTimer();
+      } else {
+        stopArtifactRefreshTimer();
+      }
+      if (opts.persist !== false) {
+        settings.layout.defaultView = viewMode;
+        saveSettingsDebounced();
+      }
+    }
+
+    viewButtons?.addEventListener("click", event => {
+      const btn = event.target.closest("button[data-view]");
+      if (!btn) return;
+      setViewMode(btn.dataset.view);
+    });
+
+    collapseAllBtn?.addEventListener("click", () => {
+      collapseAllActive = !collapseAllActive;
+      collapseAllBtn.classList.toggle("active", collapseAllActive);
+      if (collapseAllActive) closeTaskDrawer();
+      for (const [, record] of runNodes) {
+        record.node.classList.toggle("collapsed", collapseAllActive);
+      }
+    });
+
+    hudClose?.addEventListener("click", event => {
+      event.stopPropagation();
+      tauriInvoke("toggle_collapse").catch(() => {});
+    });
+
+    function applyAgentFilter() {
+      let openVisible = false;
+      for (const [, record] of runNodes) {
+        if (!agentFilterText) {
+          record.node.hidden = false;
+          for (const [, taskRecord] of record.tasks) {
+            taskRecord.node.hidden = false;
+            if (openTaskRef?.runKey === record.key && openTaskRef?.taskKey === taskRecord.key) openVisible = true;
+          }
+          continue;
+        }
+        const runLabel = `${record.elements.name.textContent} ${record.elements.identity.textContent}`.toLowerCase();
+        const runMatches = runLabel.includes(agentFilterText);
+        let anyTaskMatches = false;
+        for (const [, taskRecord] of record.tasks) {
+          const taskMatches = runMatches || taskRecord.elements.name.textContent.toLowerCase().includes(agentFilterText);
+          if (taskMatches) anyTaskMatches = true;
+          taskRecord.node.hidden = !taskMatches;
+          if (taskMatches && openTaskRef?.runKey === record.key && openTaskRef?.taskKey === taskRecord.key) openVisible = true;
+        }
+        record.node.hidden = !(runMatches || anyTaskMatches);
+      }
+      if (openTaskRef && !openVisible) closeTaskDrawer();
+      if (openTaskRef) requestAnimationFrame(renderOpenDrawer);
+    }
+
+    agentFilterInput?.addEventListener("input", () => {
+      agentFilterText = agentFilterInput.value.trim().toLowerCase();
+      applyAgentFilter();
+    });
+
+    settingsToggle?.addEventListener("click", event => {
+      event.stopPropagation();
+      settingsPanel?.classList.toggle("open");
+    });
+    document.addEventListener("click", event => {
+      if (settingsPanel && settingsPanel.classList.contains("open")
+        && !settingsPanel.contains(event.target) && event.target !== settingsToggle) {
+        settingsPanel.classList.remove("open");
+      }
+    });
+
+    accentInput?.addEventListener("input", () => {
+      settings.theme.accent = accentInput.value;
+      applySettingsToDom();
+      saveSettingsDebounced();
+    });
+    densitySelect?.addEventListener("change", () => {
+      settings.density = densitySelect.value === "compact" ? "compact" : "comfortable";
+      applySettingsToDom();
+      saveSettingsDebounced();
+    });
+    defaultViewSelect?.addEventListener("change", () => {
+      settings.layout.defaultView = normalizeViewMode(defaultViewSelect.value);
+      defaultViewSelect.value = settings.layout.defaultView;
+      saveSettingsDebounced();
+    });
+    for (const [input, key] of [
+      [showActivityInput, "showActivity"],
+      [showChildrenInput, "showChildren"],
+      [showTokensInput, "showTokens"],
+    ]) {
+      input?.addEventListener("change", () => {
+        settings.columns[key] = input.checked;
+        applySettingsToDom();
+        saveSettingsDebounced();
+      });
+    }
+
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && openTaskRef) {
+        event.preventDefault();
+        closeTaskDrawer();
+      }
+    });
+    window.addEventListener("resize", () => {
+      if (openTaskRef) requestAnimationFrame(renderOpenDrawer);
+    });
+
+    function artifactRuns() {
+      return currentRuns
+        .filter(run => run.artifact_path)
+        .sort((left, right) => {
+          const leftLive = left.state === "live" ? 1 : 0;
+          const rightLive = right.state === "live" ? 1 : 0;
+          if (leftLive !== rightLive) return rightLive - leftLive;
+          return runTimestamp(right) - runTimestamp(left);
+        });
+    }
+
+    function newestArtifactRun(runs) {
+      const live = runs
+        .filter(run => run.state === "live")
+        .sort((left, right) => runTimestamp(right) - runTimestamp(left));
+      if (live.length) return live[0];
+      return [...runs].sort((left, right) => runTimestamp(right) - runTimestamp(left))[0] || null;
+    }
+
+    function selectedArtifactRun() {
+      return artifactRuns().find(run => run.artifact_path === selectedArtifactPathValue) || null;
+    }
+
+    function selectArtifactPath(path, userSelected = false) {
+      if (selectedArtifactPathValue !== path) {
+        selectedArtifactPathValue = path;
+        lastArtifactPath = null;
+        displayedArtifactHtml = null;
+        artifactRefreshSeq++;
+      }
+      if (userSelected) artifactUserSelected = true;
+      syncArtifactTabs();
+      refreshArtifactView({force: true});
+    }
+
+    function syncArtifactSelection() {
+      const runs = artifactRuns();
+      if (!runs.length) {
+        selectedArtifactPathValue = null;
+        return;
+      }
+      const current = runs.find(run => run.artifact_path === selectedArtifactPathValue);
+      if (current && artifactUserSelected) return;
+      const target = !artifactUserSelected ? newestArtifactRun(runs) : (current || newestArtifactRun(runs));
+      if (target && selectedArtifactPathValue !== target.artifact_path) {
+        selectedArtifactPathValue = target.artifact_path;
+        lastArtifactPath = null;
+        displayedArtifactHtml = null;
+        artifactRefreshSeq++;
+      }
+    }
+
+    function syncArtifactTabs() {
+      syncArtifactSelection();
+      const runs = artifactRuns();
+      artifactTabs.hidden = runs.length === 0;
+      const html = runs.map(run => {
+        const active = run.artifact_path === selectedArtifactPathValue ? " active" : "";
+        const live = run.state === "live" ? " live" : " ended";
+        const label = `${run.run_name || "ringer"} · ${formatStartedTime(run)}`;
+        return `<button type="button" class="artifact-tab${live}${active}" data-artifact-path="${escapeHtml(run.artifact_path)}"><span class="tab-dot"></span><span>${escapeHtml(label)}</span></button>`;
+      }).join("");
+      if (artifactTabs.innerHTML !== html) artifactTabs.innerHTML = html;
+    }
+
+    artifactTabs?.addEventListener("click", event => {
+      const tab = event.target.closest("button[data-artifact-path]");
+      if (!tab) return;
+      selectArtifactPath(tab.dataset.artifactPath, true);
+    });
+
+    function selectedArtifactPath() {
+      return selectedArtifactRun()?.artifact_path || null;
+    }
+
+    function showArtifactEmpty(message) {
+      const existing = artifactFrameWrap.querySelector(".artifact-empty");
+      if (existing && existing.textContent === message) return;
+      artifactFrameWrap.innerHTML = "";
+      const empty = document.createElement("div");
+      empty.className = "artifact-empty";
+      empty.textContent = message;
+      artifactFrameWrap.appendChild(empty);
+      lastArtifactPath = null;
+      displayedArtifactHtml = null;
+    }
+
+    function showArtifactHtml(path, html) {
+      let frame = artifactFrameWrap.querySelector("iframe");
+      if (!frame) {
+        artifactFrameWrap.innerHTML = "";
+        frame = document.createElement("iframe");
+        artifactFrameWrap.appendChild(frame);
+      }
+      if (lastArtifactPath !== path || displayedArtifactHtml !== html) {
+        frame.srcdoc = html;
+        displayedArtifactHtml = html;
+      }
+      lastArtifactPath = path;
+    }
+
+    function startArtifactRefreshTimer() {
+      if (artifactRefreshTimer) return;
+      artifactRefreshTimer = setInterval(refreshArtifactView, ARTIFACT_REFRESH_MS);
+    }
+
+    function stopArtifactRefreshTimer() {
+      if (artifactRefreshTimer) {
+        clearInterval(artifactRefreshTimer);
+        artifactRefreshTimer = null;
+      }
+      artifactRefreshSeq++;
+    }
+
+    function refreshArtifactView(opts = {}) {
+      if (viewMode !== "artifact" || !IS_TAURI) return;
+      syncArtifactSelection();
+      syncArtifactTabs();
+      const run = selectedArtifactRun();
+      const path = run?.artifact_path || null;
+      if (!path) {
+        artifactRefreshSeq++;
+        showArtifactEmpty("no artifact available yet");
+        return;
+      }
+      if (run.state !== "live" && !opts.force && lastArtifactPath === path && displayedArtifactHtml !== null) {
+        return;
+      }
+      if (artifactRefreshInFlight) return;
+      const requestSeq = ++artifactRefreshSeq;
+      artifactRefreshInFlight = true;
+      tauriInvoke("read_artifact_html", {path}).then(html => {
+        if (requestSeq !== artifactRefreshSeq || viewMode !== "artifact" || selectedArtifactPath() !== path) return;
+        showArtifactHtml(path, html);
+      }).catch(() => {
+        if (requestSeq !== artifactRefreshSeq || viewMode !== "artifact" || selectedArtifactPath() !== path) return;
+        showArtifactEmpty("could not read artifact (Ringside desktop app only)");
+      }).finally(() => {
+        artifactRefreshInFlight = false;
+      });
+    }
+
+    function update(payload, opts = {}) {
+      currentRuns = normalizePayload(payload);
+      updateTopbar(currentRuns);
+      syncRunNodes(currentRuns);
+      applyAgentFilter();
+      syncArtifactTabs();
+      if (viewMode === "artifact" && !opts.tick) refreshArtifactView();
+    }
+
+    async function pollLocalState() {
+      try {
+        const response = await fetch(`/state.json?t=${Date.now()}`, {cache: "no-store"});
+        if (!response.ok) return;
+        const state = await response.json();
+        update(Array.isArray(state) ? state : [state]);
+      } catch (_err) {
+      }
+    }
+
+    configureArtifactModeAvailability();
+    loadSettings();
+    setInterval(() => update(currentRuns, {tick: true}), 250);
+    setInterval(pollLocalState, 1000);
+    pollLocalState();
+
+    (function loadTauriHudBridge() {
+      if (!IS_TAURI) return;
+      const script = document.createElement("script");
+      script.src = "hud.js";
+      script.defer = true;
+      document.head.appendChild(script);
+    })();
+  </script>
+</body>
+</html>

@@ -10,3 +10,7 @@ hud/dist/
 hud/gen/
 hud/icons/icon.iconset/
 *.log
+
+# hud/dist/index.html and hud.js are hand-authored frontend source, not build output
+!hud/dist/index.html
+!hud/dist/hud.js
