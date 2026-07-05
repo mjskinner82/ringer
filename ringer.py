@@ -641,6 +641,7 @@ class StateWriter:
                         "check_output_tail": shorten(runtime.last_check_output, 4000),
                         "timeout_s": runtime.task.timeout_s,
                         "taskdir": str(runtime.taskdir),
+                        "log_path": str(runtime.log_path),
                         "activity": worker_activity(runtime.log_path, log_tail),
                         "elapsed_s": round(runtime.elapsed_s(now), 1),
                         "tokens": runtime.tokens,
@@ -1020,7 +1021,7 @@ def render_report_row(task: dict[str, Any]) -> str:
     if taskdir:
         taskdir_path = Path(str(taskdir))
         links.append(f'<a href="file://{html_escape(str(taskdir_path))}">taskdir</a>')
-        worker_log = taskdir_path / "worker.log"
+        worker_log = Path(str(task.get("log_path") or taskdir_path / "worker.log"))
         if worker_log.exists():
             links.append(f'<a href="file://{html_escape(str(worker_log))}">worker.log</a>')
         for report_name in ("report.md", "report.html"):
