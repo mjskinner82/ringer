@@ -41,7 +41,9 @@ TASKDIR_REAL="$(cd "$TASKDIR" && pwd -P)"
 
 # Per-run scratch root — becomes both TMPDIR and XDG_CACHE_HOME for OpenCode, so
 # we never have to open all of /private/tmp or ~/.cache to the sandboxed agent.
-SCRATCH="$(mktemp -d -t ringer-opencode-scratch)"
+# Resolve to the real path (/var/folders symlinks to /private/var/folders);
+# Seatbelt subpath matching needs the canonical path or writes EPERM-crash.
+SCRATCH="$(cd "$(mktemp -d -t ringer-opencode-scratch)" && pwd -P)"
 PROFILE="$(mktemp -t ringer-opencode-prof)"
 cleanup() { rm -rf "$SCRATCH" "$PROFILE"; }
 trap cleanup EXIT
