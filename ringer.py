@@ -47,9 +47,14 @@ DEFAULT_TOKEN_REGEX = r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"
 ACTIVITY_TAIL_BYTES = 2048
 ACTIVITY_TEXT_LIMIT = 80
 ARTIFACT_WRAPPER_TAIL_BYTES = 256 * 1024
+ARTIFACT_LIBRARY_MAX_VERSIONS = 20
 TASK_REPORT_FILENAMES = ("report.md", "report.html")
 SHEPHERD_MODEL = f"none ({TOOL_NAME}.py)"
 VERIFY_METHOD = "executed-check"
+CSP_META_TAG = (
+    '<meta http-equiv="Content-Security-Policy" '
+    'content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:">'
+)
 DASHBOARD_HTML_PATH = Path(__file__).resolve().parent / "dashboard" / "dashboard.html"
 MINIMAL_DASHBOARD_HTML = """<!doctype html>
 <html lang="en">
@@ -806,14 +811,21 @@ class StateWriter:
             index_out=state_dir / "artifacts" / "index.html",
         )
         self.artifact_path = self.artifact.artifact_path(self.run_id, self.run_name)
+        self.live_path = artifact_live_path(self.state_dir, self.run_name)
+        self.version_path = artifact_version_path(self.state_dir, self.run_name, self.run_id)
         self.report_path = self.artifact.report_path(self.run_id, self.run_name)
         self.artifact_renderer = ArtifactRenderer(self.artifact_path)
         self.report_written = False
+        self.version_recorded = False
+        self._last_library_state: str | None = None
+        self._last_library_write_monotonic = 0.0
 
     def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(FileNotFoundError):
             self.path.unlink()
+        if self.artifact.enabled:
+            self._reconcile_library_safe()
         self.flush()
         self._thread = threading.Thread(target=self._loop, name="ringer-state-writer", daemon=True)
         self._thread.start()
@@ -836,12 +848,14 @@ class StateWriter:
 
     def flush(self) -> dict[str, Any]:
         state = self.snapshot()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(tmp, self.path)
         if self.artifact.enabled:
             self._write_status_artifact_safe(state)
             self._write_index_safe()
+            self._write_library_live_safe(state)
         return state
 
     def snapshot(self) -> dict[str, Any]:
@@ -913,6 +927,7 @@ class StateWriter:
                 "fail": totals["fail"],
                 "tokens": totals["tokens"],
                 "artifact_path": str(self.artifact_path) if self.artifact.enabled else None,
+                "live_path": str(self.live_path) if self.artifact.enabled else None,
                 "report_path": str(self.report_path) if self.artifact.enabled else None,
                 "report_ready": self.report_written,
             }
@@ -929,6 +944,7 @@ class StateWriter:
         try:
             html = self.artifact_renderer.render_status_html(state)
             atomic_write_text(self.artifact_path, html)
+            atomic_write_text(self.live_path, html)
         except Exception as exc:
             print(f"artifact render error (status page, non-fatal): {exc}", file=sys.stderr)
 
@@ -938,7 +954,9 @@ class StateWriter:
         try:
             html = self.artifact_renderer.render_final_report_html(state)
             atomic_write_text(self.report_path, html)
+            atomic_write_text(self.version_path, html)
             self.report_written = True
+            self._append_library_version_safe(state)
             # Re-flush the plain state JSON so report_ready/report_path are accurate for
             # anything (Ringside) polling the state file right after the run ends.
             tmp = self.path.with_suffix(".json.tmp")
@@ -948,6 +966,53 @@ class StateWriter:
             os.replace(tmp, self.path)
         except Exception as exc:
             print(f"artifact render error (final report, non-fatal): {exc}", file=sys.stderr)
+
+    def _write_library_live_safe(self, state: dict[str, Any]) -> None:
+        outcome = artifact_outcome_from_state(state)
+        now = time.monotonic()
+        if self._last_library_state == outcome and now - self._last_library_write_monotonic < 5:
+            return
+        try:
+            update_artifact_library_live(
+                self.state_dir,
+                run_name=self.run_name,
+                run_id=self.run_id,
+                identity=self.identity,
+                state=outcome,
+            )
+            self._last_library_state = outcome
+            self._last_library_write_monotonic = now
+        except Exception as exc:
+            print(f"artifact library update error (non-fatal): {exc}", file=sys.stderr)
+
+    def _append_library_version_safe(self, state: dict[str, Any]) -> None:
+        if self.version_recorded:
+            return
+        totals = state.get("totals") if isinstance(state.get("totals"), dict) else {}
+        outcome = artifact_outcome_from_state(state)
+        try:
+            append_artifact_library_version(
+                self.state_dir,
+                run_name=self.run_name,
+                run_id=self.run_id,
+                identity=self.identity,
+                outcome=outcome,
+                version_path=self.version_path,
+                report_path=self.report_path if self.report_path != self.version_path else None,
+                tasks_pass=int(totals.get("pass", state.get("pass", 0)) or 0),
+                tasks_fail=int(totals.get("fail", state.get("fail", 0)) or 0),
+            )
+            self.version_recorded = True
+            self._last_library_state = outcome
+            self._last_library_write_monotonic = time.monotonic()
+        except Exception as exc:
+            print(f"artifact library version error (non-fatal): {exc}", file=sys.stderr)
+
+    def _reconcile_library_safe(self) -> None:
+        try:
+            reconcile_artifact_library_dead_runs(self.state_dir)
+        except Exception as exc:
+            print(f"artifact library reconcile error (non-fatal): {exc}", file=sys.stderr)
 
     def _write_index_safe(self) -> None:
         try:
@@ -989,6 +1054,10 @@ def atomic_write_text(path: Path, text: str) -> None:
         if tmp_path is not None:
             with contextlib.suppress(OSError):
                 tmp_path.unlink()
+
+
+def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 def ringer_home() -> Path:
@@ -1095,6 +1164,190 @@ def unregister_active_run(run_id: str) -> None:
     runs = read_active_runs()
     runs.pop(run_id, None)
     _write_active_runs(runs)
+
+
+def artifacts_dir(state_dir: Path) -> Path:
+    return state_dir / "artifacts"
+
+
+def artifact_library_path(state_dir: Path) -> Path:
+    return artifacts_dir(state_dir) / "library.json"
+
+
+def artifact_live_path(state_dir: Path, run_name: str) -> Path:
+    return artifacts_dir(state_dir) / "live" / f"{sanitize_artifact_name(run_name)}.html"
+
+
+def artifact_version_path(state_dir: Path, run_name: str, run_id: str) -> Path:
+    return (
+        artifacts_dir(state_dir)
+        / "versions"
+        / sanitize_artifact_name(run_name)
+        / f"{sanitize_artifact_name(run_id)}.html"
+    )
+
+
+def read_artifact_library(state_dir: Path) -> dict[str, Any]:
+    path = artifact_library_path(state_dir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {"artifacts": {}}
+    if not isinstance(data, dict):
+        return {"artifacts": {}}
+    artifacts = data.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return {"artifacts": {}}
+    clean: dict[str, Any] = {"artifacts": {}}
+    for run_name, entry in artifacts.items():
+        if isinstance(run_name, str) and isinstance(entry, dict):
+            clean["artifacts"][run_name] = entry
+    return clean
+
+
+def write_artifact_library(state_dir: Path, library: dict[str, Any]) -> None:
+    atomic_write_json(artifact_library_path(state_dir), library)
+
+
+def artifact_outcome_from_state(state: dict[str, Any]) -> str:
+    if str(state.get("state", "")) == "died":
+        return "died"
+    if not bool(state.get("finished")) and str(state.get("state", "live")) == "live":
+        return "live"
+    totals = state.get("totals") if isinstance(state.get("totals"), dict) else {}
+    fail_n = int(totals.get("fail", state.get("fail", 0)) or 0)
+    return "fail" if fail_n else "pass"
+
+
+def _library_entry(
+    *,
+    state_dir: Path,
+    run_name: str,
+    run_id: str,
+    identity: str,
+    state: str,
+    now_iso: str,
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    versions = []
+    if existing and isinstance(existing.get("versions"), list):
+        versions = [item for item in existing["versions"] if isinstance(item, dict)]
+    return {
+        "live_path": str(artifact_live_path(state_dir, run_name)),
+        "state": state,
+        "identity": identity,
+        "current_run_id": run_id,
+        "updated_at": now_iso,
+        "versions": versions,
+    }
+
+
+def update_artifact_library_live(
+    state_dir: Path,
+    *,
+    run_name: str,
+    run_id: str,
+    identity: str,
+    state: str,
+    now: datetime | None = None,
+) -> None:
+    now_iso = (now or datetime.now(timezone.utc)).isoformat()
+    library = read_artifact_library(state_dir)
+    artifacts = library.setdefault("artifacts", {})
+    existing = artifacts.get(run_name) if isinstance(artifacts.get(run_name), dict) else None
+    artifacts[run_name] = _library_entry(
+        state_dir=state_dir,
+        run_name=run_name,
+        run_id=run_id,
+        identity=identity,
+        state=state,
+        now_iso=now_iso,
+        existing=existing,
+    )
+    write_artifact_library(state_dir, library)
+
+
+def append_artifact_library_version(
+    state_dir: Path,
+    *,
+    run_name: str,
+    run_id: str,
+    identity: str,
+    outcome: str,
+    version_path: Path,
+    report_path: Path | None,
+    tasks_pass: int,
+    tasks_fail: int,
+    now: datetime | None = None,
+) -> None:
+    now_iso = (now or datetime.now(timezone.utc)).isoformat()
+    library = read_artifact_library(state_dir)
+    artifacts = library.setdefault("artifacts", {})
+    existing = artifacts.get(run_name) if isinstance(artifacts.get(run_name), dict) else None
+    entry = _library_entry(
+        state_dir=state_dir,
+        run_name=run_name,
+        run_id=run_id,
+        identity=identity,
+        state=outcome,
+        now_iso=now_iso,
+        existing=existing,
+    )
+    new_version = {
+        "run_id": run_id,
+        "path": str(version_path),
+        "report_path": str(report_path) if report_path is not None else None,
+        "finished_at": now_iso,
+        "outcome": outcome,
+        "tasks_pass": tasks_pass,
+        "tasks_fail": tasks_fail,
+    }
+    versions = [new_version]
+    for version in entry["versions"]:
+        if version.get("run_id") != run_id:
+            versions.append(version)
+    entry["versions"] = versions[:ARTIFACT_LIBRARY_MAX_VERSIONS]
+    artifacts[run_name] = entry
+    write_artifact_library(state_dir, library)
+    prune_artifact_versions(state_dir, versions[ARTIFACT_LIBRARY_MAX_VERSIONS:])
+
+
+def prune_artifact_versions(state_dir: Path, versions: list[dict[str, Any]]) -> None:
+    root = artifacts_dir(state_dir).resolve()
+    for version in versions:
+        for key in ("path", "report_path"):
+            raw = version.get(key)
+            if not raw:
+                continue
+            path = Path(str(raw)).expanduser()
+            with contextlib.suppress(OSError):
+                resolved = path.resolve()
+                if resolved == root or root not in resolved.parents:
+                    continue
+                if resolved.is_file():
+                    resolved.unlink()
+                    with contextlib.suppress(OSError):
+                        resolved.parent.rmdir()
+
+
+def reconcile_artifact_library_dead_runs(state_dir: Path) -> None:
+    library = read_artifact_library(state_dir)
+    artifacts = library.get("artifacts", {})
+    if not isinstance(artifacts, dict):
+        return
+    active = read_active_runs()
+    changed = False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for entry in artifacts.values():
+        if not isinstance(entry, dict) or entry.get("state") != "live":
+            continue
+        run_id = str(entry.get("current_run_id", ""))
+        if not run_id or run_id not in active:
+            entry["state"] = "died"
+            entry["updated_at"] = now_iso
+            changed = True
+    if changed:
+        write_artifact_library(state_dir, library)
 
 
 def scan_run_states(state_dir: Path) -> list[dict[str, Any]]:
@@ -1663,6 +1916,7 @@ def render_file_wrapper_html(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{CSP_META_TAG}
 <title>{title}</title>
 <style>{ARTIFACT_BASE_CSS}</style>
 </head>
@@ -1873,6 +2127,7 @@ def render_status_html(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{CSP_META_TAG}
 <title>ringer &middot; {run_name}</title>
 <meta http-equiv="refresh" content="2">
 <style>{ARTIFACT_BASE_CSS}</style>
@@ -1914,6 +2169,7 @@ def render_final_report_html(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{CSP_META_TAG}
 <title>ringer report &middot; {run_name}</title>
 <style>{ARTIFACT_BASE_CSS}</style>
 </head>
@@ -2089,6 +2345,7 @@ def render_artifact_index_html(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{CSP_META_TAG}
 <title>ringer &middot; all runs</title>
 <meta http-equiv="refresh" content="5">
 <style>{ARTIFACT_BASE_CSS}</style>
@@ -2107,6 +2364,32 @@ def render_artifact_index_html(
 """
 
 
+def artifact_content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".html", ".htm"}:
+        return "text/html; charset=utf-8"
+    if suffix == ".json":
+        return "application/json; charset=utf-8"
+    return "application/octet-stream"
+
+
+def resolve_artifact_http_path(artifact_root: Path, request_path: str) -> Path | None:
+    if request_path == "/artifacts/library.json":
+        relative = "library.json"
+    elif request_path.startswith("/artifacts/"):
+        relative = request_path[len("/artifacts/") :]
+    else:
+        return None
+    if not relative:
+        return None
+    decoded = urllib.parse.unquote(relative)
+    root = artifact_root.resolve()
+    candidate = (root / decoded).resolve()
+    if candidate == root or root not in candidate.parents:
+        return None
+    return candidate
+
+
 class Dashboard:
     def __init__(
         self,
@@ -2114,17 +2397,20 @@ class Dashboard:
         preferred_port: int,
         hud_app_path: Path | None = None,
         force_browser: bool = False,
+        open_viewer: bool = True,
     ) -> None:
         self.state_path = state_path
         self.preferred_port = preferred_port
         self.hud_app_path = hud_app_path
         self.force_browser = force_browser
+        self.open_viewer = open_viewer
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.port: int | None = None
 
     def start(self) -> int:
         state_path = self.state_path
+        artifact_root = state_path.parent.parent / "artifacts"
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
@@ -2149,6 +2435,22 @@ class Dashboard:
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                artifact_path = resolve_artifact_http_path(artifact_root, path)
+                if artifact_path is not None:
+                    try:
+                        if not artifact_path.is_file():
+                            raise FileNotFoundError
+                        body = artifact_path.read_bytes()
+                    except (FileNotFoundError, OSError):
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", artifact_content_type(artifact_path))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 self.send_error(HTTPStatus.NOT_FOUND)
 
             def log_message(self, _format: str, *_args: Any) -> None:
@@ -2161,24 +2463,25 @@ class Dashboard:
             except OSError as exc:
                 last_error = exc
                 continue
-            self.port = port
+            self.port = int(self.httpd.server_address[1])
             break
         if self.httpd is None or self.port is None:
             raise RuntimeError(f"could not start dashboard: {last_error}")
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="ringer-dashboard", daemon=True)
         self.thread.start()
         url = f"http://localhost:{self.port}"
-        try:
-            if not self.force_browser and self.hud_app_path is not None and self.hud_app_path.exists():
-                subprocess.Popen(
-                    ["open", "-a", str(self.hud_app_path)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+        if self.open_viewer:
+            try:
+                if not self.force_browser and self.hud_app_path is not None and self.hud_app_path.exists():
+                    subprocess.Popen(
+                        ["open", "-a", str(self.hud_app_path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                else:
+                    subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
         # flush: under a pipe this line is block-buffered and only appears at
         # process exit, making live runs look dashboard-less (MBP field report).
         print(f"Dashboard: {url}", flush=True)

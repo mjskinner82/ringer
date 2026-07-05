@@ -126,70 +126,29 @@ fn resize_main_window<R: Runtime>(
 
 /// Feature 2 (embedded live artifact): read a Tier 0 HTML artifact ringer.py rendered to disk,
 /// so the frontend can embed it via `<iframe srcdoc>` without relaxing the webview CSP or
-/// touching the Tauri `asset:` protocol scope. Restricted to paths currently advertised by
-/// ringer run state (never an arbitrary path from the frontend).
+/// touching the Tauri `asset:` protocol scope. Restricted to canonical paths under
+/// `<state_dir>/artifacts`.
 #[tauri::command]
 fn read_artifact_html(path: String) -> Result<String, String> {
     let state_dir = load_state_dir();
     let requested = expand_path(&path);
-    let canonical_state_dir = state_dir
+    let canonical_artifacts_dir = state_dir
+        .join("artifacts")
         .canonicalize()
-        .map_err(|err| format!("state dir unavailable: {err}"))?;
+        .map_err(|err| format!("artifact dir unavailable: {err}"))?;
     let canonical_requested = requested
         .canonicalize()
         .map_err(|err| format!("artifact not found: {err}"))?;
-    if !is_advertised_artifact_path(&canonical_state_dir, &canonical_requested) {
-        return Err(
-            "refusing to read an artifact path not advertised by ringer state".to_string(),
-        );
+    if !canonical_requested.starts_with(&canonical_artifacts_dir) {
+        return Err("refusing to read a path outside the artifact library".to_string());
     }
     fs::read_to_string(canonical_requested).map_err(|err| err.to_string())
 }
 
-fn is_advertised_artifact_path(canonical_state_dir: &Path, canonical_requested: &Path) -> bool {
-    let canonical_runs_dir = match canonical_state_dir.join("runs").canonicalize() {
-        Ok(path) if path.starts_with(canonical_state_dir) => path,
-        _ => return false,
-    };
-    let entries = match fs::read_dir(&canonical_runs_dir) {
-        Ok(entries) => entries,
-        Err(_) => return false,
-    };
-
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(canonical_run_path) = path.canonicalize() else {
-            continue;
-        };
-        if !canonical_run_path.starts_with(&canonical_runs_dir) {
-            continue;
-        }
-        let Ok(data) = fs::read_to_string(canonical_run_path) else {
-            continue;
-        };
-        let Ok(run) = serde_json::from_str::<Value>(&data) else {
-            continue;
-        };
-        let Some(artifact_path) = run
-            .get("artifact_path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        else {
-            continue;
-        };
-        let Ok(canonical_artifact_path) = expand_path(artifact_path).canonicalize() else {
-            continue;
-        };
-        if canonical_artifact_path == canonical_requested {
-            return true;
-        }
-    }
-
-    false
+#[tauri::command]
+fn read_artifact_library() -> Result<String, String> {
+    let path = load_state_dir().join("artifacts").join("library.json");
+    fs::read_to_string(path).map_err(|err| format!("artifact library unavailable: {err}"))
 }
 
 /// Feature 5 (settings panel): plain JSON file, not UserDefaults (this is Tauri, not Swift),
@@ -232,6 +191,7 @@ fn main() {
             hide_window,
             toggle_collapse,
             resize_main_window,
+            read_artifact_library,
             read_artifact_html,
             load_settings,
             save_settings
