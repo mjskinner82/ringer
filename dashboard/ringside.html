@@ -939,7 +939,9 @@
         const leftLive = left.state === "live" ? 1 : 0;
         const rightLive = right.state === "live" ? 1 : 0;
         if (leftLive !== rightLive) return rightLive - leftLive;
-        return right.updatedTs - left.updatedTs;
+        // Stable within each group: two live runs must never swap rows as
+        // their "updated Ns ago" leapfrogs every flush (demo-night lesson).
+        return left.name.localeCompare(right.name);
       });
     }
 
