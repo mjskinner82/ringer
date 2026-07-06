@@ -81,8 +81,9 @@ class ArtifactWrapperTests(unittest.TestCase):
         report_wrapper = self.wrapper_path(self.report_md)
         self.assertTrue(log_wrapper.exists())
         self.assertTrue(report_wrapper.exists())
-        self.assertIn(file_href(log_wrapper), html)
-        self.assertIn(file_href(report_wrapper), html)
+        self.assertIn('href="view/', html)
+        self.assertIn(log_wrapper.name, html)
+        self.assertIn(report_wrapper.name, html)
         self.assertNotIn(file_href(self.worker_log), html)
         self.assertNotIn(file_href(self.report_md), html)
 
@@ -103,10 +104,14 @@ class ArtifactWrapperTests(unittest.TestCase):
     def test_final_report_links_wrappers_not_raw_files(self) -> None:
         html = render_final_report_html(self.state(), renderer=self.renderer, force_wrappers=True)
 
-        self.assertIn(file_href(self.wrapper_path(self.worker_log)), html)
-        self.assertIn(file_href(self.wrapper_path(self.report_md)), html)
+        # Links are RELATIVE (portable over http and file://) — never file:// URLs,
+        # which browsers refuse to follow from http-served pages.
+        self.assertIn(f'href="view/', html)
+        self.assertIn(self.wrapper_path(self.worker_log).name, html)
+        self.assertIn(self.wrapper_path(self.report_md).name, html)
         self.assertNotIn(file_href(self.worker_log), html)
         self.assertNotIn(file_href(self.report_md), html)
+        self.assertNotIn('href="file://', html)
         self.assertIn(">view the work log</a>", html)
         self.assertIn(">Read what it found</a>", html)
         self.assertNotIn(">worker.log</a>", html)

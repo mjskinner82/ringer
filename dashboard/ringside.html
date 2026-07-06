@@ -268,7 +268,7 @@
     .artifact-layout {
       min-height: calc(100vh - 83px);
       display: grid;
-      grid-template-columns: minmax(220px, 27vw) minmax(0, 1fr);
+      grid-template-columns: minmax(0, 1fr);
     }
     .artifact-rail {
       border-right: 1px solid var(--hairline);
@@ -436,12 +436,11 @@
 
       <section id="artifacts-panel" class="panel" role="tabpanel" aria-labelledby="tab-artifacts" hidden>
         <div class="artifact-layout">
-          <aside id="artifact-rail" class="artifact-rail" aria-label="Artifacts"></aside>
           <section class="artifact-main" aria-label="Artifact preview">
             <div class="artifact-tools">
+              <select id="artifact-picker" class="mono" aria-label="Artifact"></select>
               <div id="artifact-status" class="artifact-status">No artifact selected.</div>
               <select id="artifact-version" class="mono" aria-label="Artifact version"></select>
-              <button id="artifact-refresh" type="button">Refresh</button>
             </div>
             <div id="frame-wrap" class="frame-wrap">
               <div class="artifact-error">No artifacts yet.</div>
@@ -483,10 +482,9 @@
       livePanel: document.getElementById("live-panel"),
       artifactsPanel: document.getElementById("artifacts-panel"),
       runs: document.getElementById("runs"),
-      artifactRail: document.getElementById("artifact-rail"),
+      artifactPicker: document.getElementById("artifact-picker"),
       artifactStatus: document.getElementById("artifact-status"),
       artifactVersion: document.getElementById("artifact-version"),
-      artifactRefresh: document.getElementById("artifact-refresh"),
       frameWrap: document.getElementById("frame-wrap")
     };
 
@@ -634,10 +632,8 @@
     function preserveScroll(mutate) {
       const scroller = document.scrollingElement || document.documentElement;
       const pageY = scroller.scrollTop;
-      const railY = els.artifactRail ? els.artifactRail.scrollTop : 0;
       mutate();
       scroller.scrollTop = pageY;
-      if (els.artifactRail) els.artifactRail.scrollTop = railY;
     }
 
     function renderTop() {
@@ -1035,52 +1031,29 @@
 
     function renderArtifacts() {
       syncArtifactSelection();
-      const rail = document.createDocumentFragment();
+      const options = document.createDocumentFragment();
       if (!state.artifacts.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty";
-        empty.textContent = state.libraryError ? "Artifact library unavailable. Keeping this tab ready while Ringside reconnects." : "No artifacts yet.";
-        rail.appendChild(empty);
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = state.libraryError ? "Ringside reconnecting…" : "No artifacts yet";
+        options.appendChild(option);
       } else {
         state.artifacts.forEach(artifact => {
-          const row = document.createElement("button");
-          row.type = "button";
-          row.className = `artifact-row ${artifactStateClass(artifact.state)}`;
-          row.setAttribute("aria-current", String(artifact.name === state.artifactName));
-          row.addEventListener("click", () => {
-            state.artifactName = artifact.name;
-            state.artifactManual = true;
-            state.artifactVersion = "live";
-            state.frameKey = "";
-            sessionStorage.setItem(ARTIFACT_KEY, artifact.name);
-            renderArtifacts();
-            loadArtifactFrame(true);
-          });
-          const dot = document.createElement("span");
-          dot.className = "artifact-state-dot";
-          dot.setAttribute("aria-hidden", "true");
-          const main = document.createElement("span");
-          main.className = "artifact-row-main";
-          const name = document.createElement("span");
-          name.className = "artifact-name";
-          name.textContent = artifact.name;
-          const age = document.createElement("span");
-          age.className = "artifact-age mono";
-          age.textContent = `updated ${relativeAgo(artifact.updated_at)}`;
-          main.append(name, age);
-          row.append(dot, main);
-          rail.appendChild(row);
+          const option = document.createElement("option");
+          option.value = artifact.name;
+          const marker = artifact.state === "live" ? "● " : "";
+          option.textContent = `${marker}${artifact.name} — ${artifact.state === "live" ? "live" : artifact.state} · updated ${relativeAgo(artifact.updated_at)}`;
+          option.selected = artifact.name === state.artifactName;
+          options.appendChild(option);
         });
       }
-      preserveScroll(() => { els.artifactRail.replaceChildren(rail); });
-      renderArtifactControls();
-      if (state.tab === "artifacts") loadArtifactFrame(false);
+      els.artifactPicker.replaceChildren(options);
+      els.artifactPicker.disabled = !state.artifacts.length;
     }
 
     function renderArtifactControls() {
       const artifact = selectedArtifact();
       const target = selectedArtifactTarget();
-      els.artifactRefresh.disabled = !target?.src;
       if (!artifact) {
         els.artifactStatus.textContent = state.libraryError ? "reconnecting…" : "No artifact selected.";
         els.artifactVersion.replaceChildren();
@@ -1216,8 +1189,16 @@
       renderArtifactControls();
       loadArtifactFrame(true);
     });
-    els.artifactRefresh.addEventListener("click", () => {
-      fetchLibrary();
+    els.artifactPicker.addEventListener("change", () => {
+      const name = els.artifactPicker.value;
+      if (!name) return;
+      state.artifactName = name;
+      state.artifactManual = true;
+      state.artifactVersion = "live";
+      state.frameKey = "";
+      sessionStorage.setItem(ARTIFACT_KEY, name);
+      renderArtifacts();
+      renderArtifactControls();
       loadArtifactFrame(true);
     });
     document.addEventListener("keydown", event => {

@@ -2690,7 +2690,7 @@ def render_status_html(
     <h2 id="status-updates-heading">What's happening</h2>
     {render_status_updates(updates, omitted=omitted)}
   </section>
-  {render_task_strip(tasks, state=state, renderer=renderer, force_wrappers=force_wrappers)}
+  {render_task_strip(tasks, state=state, renderer=renderer, force_wrappers=force_wrappers, page_path=page_path)}
   <footer>
     <span class="mono">Updated {html_escape(local_time_label())}</span>
     <span>·</span>
@@ -2734,7 +2734,7 @@ def render_final_report_html(
     <h2 id="status-updates-heading">What's happening</h2>
     {render_status_updates(updates, omitted=omitted)}
   </section>
-  {render_task_strip(tasks, state=state, renderer=renderer, force_wrappers=force_wrappers)}
+  {render_task_strip(tasks, state=state, renderer=renderer, force_wrappers=force_wrappers, page_path=page_path)}
   <footer>
     <span class="mono">Finished {html_escape(local_time_label())}</span>
   </footer>
@@ -2750,9 +2750,10 @@ def render_task_strip(
     state: dict[str, Any],
     renderer: ArtifactRenderer | None = None,
     force_wrappers: bool = False,
+    page_path: Path | None = None,
 ) -> str:
     rows = "".join(
-        render_task_item(task, state=state, renderer=renderer, force_wrappers=force_wrappers)
+        render_task_item(task, state=state, renderer=renderer, force_wrappers=force_wrappers, page_path=page_path)
         for task in tasks
     )
     if not rows:
@@ -2769,6 +2770,7 @@ def render_task_item(
     state: dict[str, Any] | None = None,
     renderer: ArtifactRenderer | None = None,
     force_wrappers: bool = False,
+    page_path: Path | None = None,
 ) -> str:
     status = str(task.get("status", "queued"))
     key = html_escape(str(task.get("key", "")))
@@ -2787,6 +2789,7 @@ def render_task_item(
         state=state or {},
         renderer=renderer,
         force_wrappers=force_wrappers,
+        page_path=page_path,
     )
 
     # Close the trust loop for finished work: say in plain English what the
@@ -2830,7 +2833,20 @@ def render_task_links(
     state: dict[str, Any],
     renderer: ArtifactRenderer | None = None,
     force_wrappers: bool = False,
+    page_path: Path | None = None,
 ) -> str:
+
+    def portable(href_path: Path) -> str:
+        # A page viewed over http cannot follow file:// links — resolve
+        # anything inside the artifact store to a relative href instead.
+        if renderer is not None:
+            with contextlib.suppress(Exception):
+                resolved = href_path.resolve()
+                if resolved.is_relative_to(renderer.artifact_dir.resolve()):
+                    return artifact_relative_href(
+                        resolved, page_path=page_path, artifact_root=renderer.artifact_dir
+                    )
+        return file_href(href_path)
     links: list[str] = []
     taskdir_path: Path | None = None
     taskdir = task.get("taskdir")
@@ -2848,16 +2864,11 @@ def render_task_links(
         if report_file is None and taskdir_path is not None:
             report_file = taskdir_path / report_name
         if report_file is not None and report_file.exists():
-            href = (
-                renderer.link_for_source(
-                    report_file,
-                    state=state,
-                    task_key=task_key,
-                    force=force_wrappers,
-                )
-                if renderer
-                else file_href(report_file)
-            )
+            if renderer:
+                renderer.link_for_source(report_file, state=state, task_key=task_key, force=force_wrappers)
+                href = portable(renderer.wrapper_path(run_id=str(state.get("run_id") or "run"), task_key=task_key, source_name=report_file.name)) if not is_html_artifact(report_file) else portable(report_file)
+            else:
+                href = file_href(report_file)
             links.append(f'<a href="{html_escape(href)}">Read what it found</a>')
             break
 
@@ -2866,16 +2877,11 @@ def render_task_links(
     if worker_log is None and taskdir_path is not None:
         worker_log = taskdir_path / "worker.log"
     if worker_log is not None and worker_log.exists():
-        href = (
-            renderer.link_for_source(
-                worker_log,
-                state=state,
-                task_key=task_key,
-                force=force_wrappers,
-            )
-            if renderer
-            else file_href(worker_log)
-        )
+        if renderer:
+            renderer.link_for_source(worker_log, state=state, task_key=task_key, force=force_wrappers)
+            href = portable(renderer.wrapper_path(run_id=str(state.get("run_id") or "run"), task_key=task_key, source_name=worker_log.name))
+        else:
+            href = file_href(worker_log)
         links.append(f'<a href="{html_escape(href)}">view the work log</a>')
 
     return " &middot; ".join(links) if links else '<span class="muted">—</span>'
