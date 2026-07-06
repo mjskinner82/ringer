@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import json
+import mimetypes
 import os
 import re
 import shlex
@@ -24,6 +26,8 @@ import threading
 import time
 import tomllib
 import urllib.parse
+import urllib.request
+import webbrowser
 from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from html import escape as html_escape
@@ -43,13 +47,25 @@ DEFAULT_ENGINE_NAME = "codex"
 DEFAULT_TIMEOUT_S = 900
 CHECK_TIMEOUT_S = 60
 DEFAULT_DASHBOARD_PORT_BASE = 8787
+DEFAULT_HUD_PORT = 8700
 DEFAULT_TOKEN_REGEX = r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"
 ACTIVITY_TAIL_BYTES = 2048
 ACTIVITY_TEXT_LIMIT = 80
+ARTIFACT_WRAPPER_TAIL_BYTES = 256 * 1024
+ARTIFACT_LIBRARY_MAX_VERSIONS = 20
+DELIVERABLE_MAX_BYTES = 20 * 1024 * 1024
+WORKER_LOG_TAIL_BYTES = 64 * 1024
 TASK_REPORT_FILENAMES = ("report.md", "report.html")
+TEXT_DELIVERABLE_SUFFIXES = {".md", ".txt", ".log"}
+IMAGE_DELIVERABLE_SUFFIXES = {".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
 SHEPHERD_MODEL = f"none ({TOOL_NAME}.py)"
 VERIFY_METHOD = "executed-check"
+CSP_META_TAG = (
+    '<meta http-equiv="Content-Security-Policy" '
+    'content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:">'
+)
 DASHBOARD_HTML_PATH = Path(__file__).resolve().parent / "dashboard" / "dashboard.html"
+RINGSIDE_HTML_PATH = Path(__file__).resolve().parent / "dashboard" / "ringside.html"
 MINIMAL_DASHBOARD_HTML = """<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>ringer dashboard</title></head>
@@ -139,6 +155,7 @@ class AppConfig:
     identity_default: str | None
     state_dir: Path
     dashboard_port_base: int
+    hud_port: int
     hud_app_path: Path | None
     allow_full_access: bool
     eval: EvalConfig
@@ -163,6 +180,7 @@ class AppConfig:
         dashboard_port_base = int(data.get("dashboard_port_base", DEFAULT_DASHBOARD_PORT_BASE))
         if dashboard_port_base <= 0:
             raise ValueError("dashboard_port_base must be positive")
+        hud_port = load_hud_port(data.get("hud"))
         identity_default = optional_string(data.get("identity_default"))
         hud_app_path = optional_path(data.get("hud_app_path"))
         allow_full_access = bool(data.get("allow_full_access", False))
@@ -174,6 +192,7 @@ class AppConfig:
             identity_default=identity_default,
             state_dir=state_dir,
             dashboard_port_base=dashboard_port_base,
+            hud_port=hud_port,
             hud_app_path=hud_app_path,
             allow_full_access=allow_full_access,
             eval=eval_config,
@@ -273,6 +292,17 @@ def load_eval_config(raw: Any, state_dir: Path) -> EvalConfig:
     return EvalConfig(backend=backend, jsonl_path=jsonl_path, postgres=postgres)
 
 
+def load_hud_port(raw: Any) -> int:
+    if raw is None:
+        return DEFAULT_HUD_PORT
+    if not isinstance(raw, dict):
+        raise ValueError("hud must be a TOML table")
+    port = int(raw.get("port", DEFAULT_HUD_PORT))
+    if port <= 0:
+        raise ValueError("hud.port must be positive")
+    return port
+
+
 def load_engines(raw: Any) -> dict[str, EngineConfig]:
     engines: dict[str, EngineConfig] = {DEFAULT_ENGINE_NAME: built_in_codex_engine()}
     if raw is None:
@@ -333,16 +363,24 @@ class TaskSpec:
     timeout_s: int = DEFAULT_TIMEOUT_S
     full_access: bool = False
     engine_args: tuple[str, ...] = ()
+    verified: str = ""
 
     @classmethod
     def from_obj(cls, obj: dict[str, Any]) -> "TaskSpec":
-        key = str(obj.get("key", "")).strip()
-        spec = str(obj.get("spec", ""))
-        check = str(obj.get("check", ""))
+        key_raw = obj.get("key", "")
+        if not isinstance(key_raw, str):
+            raise ValueError("task key must be a string")
+        key = key_raw.strip()
         if not key:
             raise ValueError("task key is required")
+        spec = obj.get("spec", "")
+        if not isinstance(spec, str):
+            raise ValueError(f"task {key}: spec must be a string")
         if not spec:
             raise ValueError(f"task {key}: spec is required")
+        check = obj.get("check", "")
+        if not isinstance(check, str):
+            raise ValueError(f"task {key}: check must be a string")
         if not check:
             raise ValueError(f"task {key}: check is required")
         expect_files = obj.get("expect_files", [])
@@ -357,6 +395,9 @@ class TaskSpec:
         engine_args = obj.get("engine_args", [])
         if not isinstance(engine_args, list) or not all(isinstance(item, str) for item in engine_args):
             raise ValueError(f"task {key}: engine_args must be a list of strings")
+        verified = obj.get("verified", "")
+        if not isinstance(verified, str):
+            raise ValueError(f"task {key}: verified must be a string (plain-English description of what the check proves)")
         return cls(
             key=key,
             spec=spec,
@@ -366,6 +407,7 @@ class TaskSpec:
             timeout_s=timeout_s,
             full_access=bool(obj.get("full_access", False)),
             engine_args=tuple(engine_args),
+            verified=verified.strip(),
         )
 
 
@@ -455,12 +497,229 @@ class Manifest:
         )
 
 
+FILE_TEST_OPS = {"-e", "-f", "-s", "-d", "-r", "-w", "-x", "-L"}
+
+
+def lint_manifest(manifest: Manifest) -> list[str]:
+    findings: list[str] = []
+
+    for task in manifest.tasks:
+        if check_cannot_fail(task.check):
+            findings.append(f"{task.key}: check cannot fail, so the task cannot be verified.")
+        if check_may_fail_silently(task.check):
+            findings.append(
+                f"{task.key}: check may fail without printing why; retry prompt and eval log depend on failure output."
+            )
+        if manifest.worktrees and any(is_relative_expect_file(path) for path in task.expect_files):
+            findings.append(
+                f"{task.key}: deliverable would be deleted with the worktree; write it outside the worktree or export it in the check."
+            )
+        if manifest.worktrees and instructs_git_commit(task.spec):
+            findings.append(
+                f"{task.key}: worker commits die with the worktree; have the worker leave changes uncommitted and export the diff in the check."
+            )
+        if len(task.spec.strip()) < 80:
+            findings.append(
+                f"{task.key}: spec is probably underspecified; workers are stateless and cannot ask questions."
+            )
+        if not task.verified:
+            findings.append(
+                f"{task.key}: no 'verified' description; a reader of the results page sees "
+                "'checked' but not what the check proves — add one plain-English sentence."
+            )
+
+    if len(manifest.tasks) >= 3 and manifest.max_parallel == 1:
+        findings.append("manifest: tasks will run serially; set max_parallel.")
+
+    if not manifest.worktrees:
+        # Relative expect_files resolve inside each task's own directory and
+        # cannot collide; only a shared absolute path is a real collision.
+        paths_to_tasks: dict[str, list[str]] = {}
+        for task in manifest.tasks:
+            for path in task.expect_files:
+                if not Path(path).expanduser().is_absolute():
+                    continue
+                paths_to_tasks.setdefault(path, []).append(task.key)
+        for path, task_keys in paths_to_tasks.items():
+            if len(task_keys) >= 2:
+                findings.append(
+                    f"manifest: write collision on {path}: listed by {', '.join(task_keys)}."
+                )
+
+    return findings
+
+
+def check_cannot_fail(check: str) -> bool:
+    stripped = strip_shell_comments(check).strip()
+    if stripped in {"true", ":", "exit 0"}:
+        return True
+    return consists_only_of_echo_commands(stripped)
+
+
+def strip_shell_comments(command: str) -> str:
+    result: list[str] = []
+    in_single = False
+    in_double = False
+    escaped = False
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if escaped:
+            result.append(char)
+            escaped = False
+            i += 1
+            continue
+        if char == "\\" and not in_single:
+            result.append(char)
+            escaped = True
+            i += 1
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            result.append(char)
+            i += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            result.append(char)
+            i += 1
+            continue
+        if (
+            char == "#"
+            and not in_single
+            and not in_double
+            and (not result or result[-1].isspace())
+        ):
+            while i < len(command) and command[i] != "\n":
+                i += 1
+            continue
+        result.append(char)
+        i += 1
+    return "".join(result)
+
+
+def consists_only_of_echo_commands(command: str) -> bool:
+    if not command or "||" in command or re.search(r"[|<>]", command):
+        return False
+    parts = [part.strip() for part in re.split(r"(?:&&|;|\n)+", command) if part.strip()]
+    if not parts:
+        return False
+    for part in parts:
+        try:
+            tokens = shlex.split(part)
+        except ValueError:
+            return False
+        if not tokens or tokens[0] != "echo":
+            return False
+    return True
+
+
+def check_may_fail_silently(check: str) -> bool:
+    stripped = strip_shell_comments(check).strip()
+    if has_quiet_diff_probe(stripped):
+        return not has_failure_output_branch(stripped)
+    if not stripped or "||" in stripped:
+        return False
+    if re.search(r"(?:;|\n|\|)", stripped):
+        return False
+    parts = [part.strip() for part in stripped.split("&&") if part.strip()]
+    return bool(parts) and all(is_silent_probe(part) for part in parts)
+
+
+def has_quiet_diff_probe(command: str) -> bool:
+    return any(has_command_prefix(part, ("diff", "-q")) for part in command_parts(command))
+
+
+def has_failure_output_branch(command: str) -> bool:
+    if "||" not in command:
+        return False
+    branch = command.split("||", 1)[1]
+    return any(
+        has_command_prefix(part, (prefix,))
+        for part in command_parts(branch)
+        for prefix in ("echo", "printf", "cat", "diff", "ls")
+    )
+
+
+def command_parts(command: str) -> list[str]:
+    return [part.strip(" \t{}()") for part in re.split(r"(?:&&|\|\||;|\n)+", command) if part.strip()]
+
+
+def has_command_prefix(command: str, prefix: tuple[str, ...]) -> bool:
+    try:
+        tokens = shlex.split(strip_common_redirections(command))
+    except ValueError:
+        return False
+    return len(tokens) >= len(prefix) and tuple(tokens[: len(prefix)]) == prefix
+
+
+def is_silent_probe(command: str) -> bool:
+    return is_file_existence_test(command) or is_quiet_grep(command)
+
+
+def is_quiet_grep(command: str) -> bool:
+    command = strip_common_redirections(command.strip())
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(tokens) and tokens[0] == "grep" and any(
+        token == "-q" or (token.startswith("-") and "q" in token[1:]) for token in tokens[1:]
+    )
+
+
+def is_file_existence_test(command: str) -> bool:
+    command = strip_common_redirections(command.strip())
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if len(tokens) >= 3 and tokens[0] == "test" and tokens[1] in FILE_TEST_OPS:
+        return True
+    return len(tokens) >= 4 and tokens[0] == "[" and tokens[1] in FILE_TEST_OPS and tokens[-1] == "]"
+
+
+def strip_common_redirections(command: str) -> str:
+    command = re.sub(r"\s+\d?>&\d+\s*$", "", command)
+    command = re.sub(r"\s+\d?>\S+\s*$", "", command)
+    return command.strip()
+
+
+def is_relative_expect_file(path: str) -> bool:
+    return bool(path.strip()) and not path.startswith("~") and not Path(path).is_absolute()
+
+
+def instructs_git_commit(spec: str) -> bool:
+    lower = spec.lower()
+    start = 0
+    while True:
+        index = lower.find("git commit", start)
+        if index == -1:
+            return False
+        prefix = lower[max(0, index - 48) : index]
+        if not is_negated_git_commit(prefix):
+            return True
+        start = index + len("git commit")
+
+
+def is_negated_git_commit(prefix: str) -> bool:
+    separators = r"[\s`'\"()\[\]{}:;,.!?-]*"
+    return bool(
+        re.search(
+            rf"(?:do\s+not|don't|never|no){separators}(?:run{separators})?$",
+            prefix,
+        )
+    )
+
+
 @dataclass
 class TaskRuntime:
     task: TaskSpec
     taskdir: Path
     log_path: Path
     report_paths: dict[str, Path] = field(default_factory=dict)
+    deliverables: list[dict[str, Any]] = field(default_factory=list)
+    deliverable_notes: list[str] = field(default_factory=list)
     status: str = "queued"
     spec_short: str = ""
     attempts: int = 0
@@ -588,13 +847,21 @@ class StateWriter:
             index_out=state_dir / "artifacts" / "index.html",
         )
         self.artifact_path = self.artifact.artifact_path(self.run_id, self.run_name)
+        self.live_path = artifact_live_path(self.state_dir, self.run_name)
+        self.version_path = artifact_version_path(self.state_dir, self.run_name, self.run_id)
         self.report_path = self.artifact.report_path(self.run_id, self.run_name)
+        self.artifact_renderer = ArtifactRenderer(self.artifact_path)
         self.report_written = False
+        self.version_recorded = False
+        self._last_library_state: str | None = None
+        self._last_library_write_monotonic = 0.0
 
     def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(FileNotFoundError):
             self.path.unlink()
+        if self.artifact.enabled:
+            self._reconcile_library_safe()
         self.flush()
         self._thread = threading.Thread(target=self._loop, name="ringer-state-writer", daemon=True)
         self._thread.start()
@@ -617,12 +884,14 @@ class StateWriter:
 
     def flush(self) -> dict[str, Any]:
         state = self.snapshot()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(tmp, self.path)
         if self.artifact.enabled:
             self._write_status_artifact_safe(state)
             self._write_index_safe()
+            self._write_library_live_safe(state)
         return state
 
     def snapshot(self) -> dict[str, Any]:
@@ -643,6 +912,7 @@ class StateWriter:
                         "engine": runtime.task.engine,
                         "spec": runtime.task.spec,
                         "spec_short": runtime.spec_short,
+                        "verified": runtime.task.verified,
                         "check": runtime.task.check,
                         "check_returncode": runtime.last_check_returncode,
                         "check_timed_out": runtime.last_check_timed_out,
@@ -653,6 +923,8 @@ class StateWriter:
                         "report_paths": {
                             name: str(path) for name, path in runtime.report_paths.items()
                         },
+                        "deliverables": [dict(item) for item in runtime.deliverables],
+                        "deliverable_notes": list(runtime.deliverable_notes),
                         "activity": worker_activity(runtime.log_path, log_tail),
                         "elapsed_s": round(runtime.elapsed_s(now), 1),
                         "tokens": runtime.tokens,
@@ -683,6 +955,7 @@ class StateWriter:
                 "state": "finished" if self.finished else "live",
                 "pid": self.pid,
                 "port": self.port,
+                "dashboard_port": self.port,
                 "max_parallel": self.max_parallel,
                 "finished": self.finished,
                 "summary": self.summary if self.finished else None,
@@ -694,6 +967,7 @@ class StateWriter:
                 "fail": totals["fail"],
                 "tokens": totals["tokens"],
                 "artifact_path": str(self.artifact_path) if self.artifact.enabled else None,
+                "live_path": str(self.live_path) if self.artifact.enabled else None,
                 "report_path": str(self.report_path) if self.artifact.enabled else None,
                 "report_ready": self.report_written,
             }
@@ -708,8 +982,26 @@ class StateWriter:
 
     def _write_status_artifact_safe(self, state: dict[str, Any]) -> None:
         try:
-            html = render_status_html(state)
-            atomic_write_text(self.artifact_path, html)
+            if bool(state.get("finished")) or str(state.get("state")) == "finished":
+                artifact_html = self.artifact_renderer.render_final_report_html(
+                    state,
+                    page_path=self.artifact_path,
+                )
+                live_html = self.artifact_renderer.render_final_report_html(
+                    state,
+                    page_path=self.live_path,
+                )
+            else:
+                artifact_html = self.artifact_renderer.render_status_html(
+                    state,
+                    page_path=self.artifact_path,
+                )
+                live_html = self.artifact_renderer.render_status_html(
+                    state,
+                    page_path=self.live_path,
+                )
+            atomic_write_text(self.artifact_path, artifact_html)
+            atomic_write_text(self.live_path, live_html)
         except Exception as exc:
             print(f"artifact render error (status page, non-fatal): {exc}", file=sys.stderr)
 
@@ -717,9 +1009,18 @@ class StateWriter:
         if not self.artifact.enabled:
             return
         try:
-            html = render_final_report_html(state)
-            atomic_write_text(self.report_path, html)
+            report_html = self.artifact_renderer.render_final_report_html(
+                state,
+                page_path=self.report_path,
+            )
+            version_html = self.artifact_renderer.render_final_report_html(
+                state,
+                page_path=self.version_path,
+            )
+            atomic_write_text(self.report_path, report_html)
+            atomic_write_text(self.version_path, version_html)
             self.report_written = True
+            self._append_library_version_safe(state)
             # Re-flush the plain state JSON so report_ready/report_path are accurate for
             # anything (Ringside) polling the state file right after the run ends.
             tmp = self.path.with_suffix(".json.tmp")
@@ -730,10 +1031,58 @@ class StateWriter:
         except Exception as exc:
             print(f"artifact render error (final report, non-fatal): {exc}", file=sys.stderr)
 
+    def _write_library_live_safe(self, state: dict[str, Any]) -> None:
+        outcome = artifact_outcome_from_state(state)
+        now = time.monotonic()
+        if self._last_library_state == outcome and now - self._last_library_write_monotonic < 5:
+            return
+        try:
+            update_artifact_library_live(
+                self.state_dir,
+                run_name=self.run_name,
+                run_id=self.run_id,
+                identity=self.identity,
+                state=outcome,
+            )
+            self._last_library_state = outcome
+            self._last_library_write_monotonic = now
+        except Exception as exc:
+            print(f"artifact library update error (non-fatal): {exc}", file=sys.stderr)
+
+    def _append_library_version_safe(self, state: dict[str, Any]) -> None:
+        if self.version_recorded:
+            return
+        totals = state.get("totals") if isinstance(state.get("totals"), dict) else {}
+        outcome = artifact_outcome_from_state(state)
+        try:
+            append_artifact_library_version(
+                self.state_dir,
+                run_name=self.run_name,
+                run_id=self.run_id,
+                identity=self.identity,
+                outcome=outcome,
+                version_path=self.version_path,
+                report_path=self.report_path if self.report_path != self.version_path else None,
+                tasks_pass=int(totals.get("pass", state.get("pass", 0)) or 0),
+                tasks_fail=int(totals.get("fail", state.get("fail", 0)) or 0),
+                deliverables=collect_state_deliverables(state),
+            )
+            self.version_recorded = True
+            self._last_library_state = outcome
+            self._last_library_write_monotonic = time.monotonic()
+        except Exception as exc:
+            print(f"artifact library version error (non-fatal): {exc}", file=sys.stderr)
+
+    def _reconcile_library_safe(self) -> None:
+        try:
+            reconcile_artifact_library_dead_runs(self.state_dir)
+        except Exception as exc:
+            print(f"artifact library reconcile error (non-fatal): {exc}", file=sys.stderr)
+
     def _write_index_safe(self) -> None:
         try:
             entries = scan_run_states(self.state_dir)
-            html = render_artifact_index_html(entries)
+            html = self.artifact_renderer.render_artifact_index_html(entries)
             atomic_write_text(self.artifact.index_out, html)
         except Exception as exc:
             print(f"artifact render error (index, non-fatal): {exc}", file=sys.stderr)
@@ -770,6 +1119,311 @@ def atomic_write_text(path: Path, text: str) -> None:
         if tmp_path is not None:
             with contextlib.suppress(OSError):
                 tmp_path.unlink()
+
+
+def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def ringer_home() -> Path:
+    value = os.environ.get(f"{ENV_VAR_PREFIX}_HOME")
+    if value and value.strip():
+        return Path(value).expanduser().resolve()
+    return (Path.home() / STATE_DIR_NAME).resolve()
+
+
+def active_runs_path() -> Path:
+    return ringer_home() / "active-runs.json"
+
+
+def pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_active_runs_raw(path: Path) -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    runs: dict[str, dict[str, Any]] = {}
+    for run_id, value in data.items():
+        if isinstance(run_id, str) and isinstance(value, dict):
+            runs[run_id] = value
+    return runs
+
+
+def _prune_active_runs(runs: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    pruned: dict[str, dict[str, Any]] = {}
+    for run_id, entry in runs.items():
+        pid = entry.get("pid")
+        if isinstance(pid, bool):
+            continue
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if not pid_is_alive(pid_int):
+            continue
+        pruned[run_id] = {
+            "pid": pid_int,
+            "identity": str(entry.get("identity", "")),
+            "run_name": str(entry.get("run_name", "")),
+            "workdir": str(entry.get("workdir", "")),
+            "started_at": str(entry.get("started_at", "")),
+        }
+    return pruned
+
+
+def _write_active_runs(runs: dict[str, dict[str, Any]]) -> None:
+    path = active_runs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(_prune_active_runs(runs), indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_active_runs() -> dict[str, dict[str, Any]]:
+    path = active_runs_path()
+    runs = _read_active_runs_raw(path)
+    pruned = _prune_active_runs(runs)
+    if pruned != runs:
+        _write_active_runs(pruned)
+    return pruned
+
+
+def register_active_run(
+    run_id: str,
+    identity: str,
+    run_name: str,
+    workdir: Path,
+    *,
+    pid: int | None = None,
+    started_at: datetime | None = None,
+) -> None:
+    runs = read_active_runs()
+    runs[run_id] = {
+        "pid": int(pid if pid is not None else os.getpid()),
+        "identity": identity,
+        "run_name": run_name,
+        "workdir": str(workdir),
+        "started_at": (started_at or datetime.now(timezone.utc)).isoformat(),
+    }
+    _write_active_runs(runs)
+
+
+def unregister_active_run(run_id: str) -> None:
+    runs = read_active_runs()
+    runs.pop(run_id, None)
+    _write_active_runs(runs)
+
+
+def artifacts_dir(state_dir: Path) -> Path:
+    return state_dir / "artifacts"
+
+
+def artifact_library_path(state_dir: Path) -> Path:
+    return artifacts_dir(state_dir) / "library.json"
+
+
+def artifact_live_path(state_dir: Path, run_name: str) -> Path:
+    return artifacts_dir(state_dir) / "live" / f"{sanitize_artifact_name(run_name)}.html"
+
+
+def artifact_version_path(state_dir: Path, run_name: str, run_id: str) -> Path:
+    return (
+        artifacts_dir(state_dir)
+        / "versions"
+        / sanitize_artifact_name(run_name)
+        / f"{sanitize_artifact_name(run_id)}.html"
+    )
+
+
+def artifact_deliverables_dir(state_dir: Path, run_id: str, task_key: str) -> Path:
+    return (
+        artifacts_dir(state_dir)
+        / "deliverables"
+        / sanitize_artifact_name(run_id)
+        / sanitize_artifact_name(task_key)
+    )
+
+
+def read_artifact_library(state_dir: Path) -> dict[str, Any]:
+    path = artifact_library_path(state_dir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {"artifacts": {}}
+    if not isinstance(data, dict):
+        return {"artifacts": {}}
+    artifacts = data.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return {"artifacts": {}}
+    clean: dict[str, Any] = {"artifacts": {}}
+    for run_name, entry in artifacts.items():
+        if isinstance(run_name, str) and isinstance(entry, dict):
+            clean["artifacts"][run_name] = entry
+    return clean
+
+
+def write_artifact_library(state_dir: Path, library: dict[str, Any]) -> None:
+    atomic_write_json(artifact_library_path(state_dir), library)
+
+
+def artifact_outcome_from_state(state: dict[str, Any]) -> str:
+    if str(state.get("state", "")) == "died":
+        return "died"
+    if not bool(state.get("finished")) and str(state.get("state", "live")) == "live":
+        return "live"
+    totals = state.get("totals") if isinstance(state.get("totals"), dict) else {}
+    fail_n = int(totals.get("fail", state.get("fail", 0)) or 0)
+    return "fail" if fail_n else "pass"
+
+
+def _library_entry(
+    *,
+    state_dir: Path,
+    run_name: str,
+    run_id: str,
+    identity: str,
+    state: str,
+    now_iso: str,
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    versions = []
+    if existing and isinstance(existing.get("versions"), list):
+        versions = [item for item in existing["versions"] if isinstance(item, dict)]
+    return {
+        "live_path": str(artifact_live_path(state_dir, run_name)),
+        "state": state,
+        "identity": identity,
+        "current_run_id": run_id,
+        "updated_at": now_iso,
+        "versions": versions,
+    }
+
+
+def update_artifact_library_live(
+    state_dir: Path,
+    *,
+    run_name: str,
+    run_id: str,
+    identity: str,
+    state: str,
+    now: datetime | None = None,
+) -> None:
+    now_iso = (now or datetime.now(timezone.utc)).isoformat()
+    library = read_artifact_library(state_dir)
+    artifacts = library.setdefault("artifacts", {})
+    existing = artifacts.get(run_name) if isinstance(artifacts.get(run_name), dict) else None
+    artifacts[run_name] = _library_entry(
+        state_dir=state_dir,
+        run_name=run_name,
+        run_id=run_id,
+        identity=identity,
+        state=state,
+        now_iso=now_iso,
+        existing=existing,
+    )
+    write_artifact_library(state_dir, library)
+
+
+def append_artifact_library_version(
+    state_dir: Path,
+    *,
+    run_name: str,
+    run_id: str,
+    identity: str,
+    outcome: str,
+    version_path: Path,
+    report_path: Path | None,
+    tasks_pass: int,
+    tasks_fail: int,
+    deliverables: list[dict[str, Any]] | None = None,
+    now: datetime | None = None,
+) -> None:
+    now_iso = (now or datetime.now(timezone.utc)).isoformat()
+    library = read_artifact_library(state_dir)
+    artifacts = library.setdefault("artifacts", {})
+    existing = artifacts.get(run_name) if isinstance(artifacts.get(run_name), dict) else None
+    entry = _library_entry(
+        state_dir=state_dir,
+        run_name=run_name,
+        run_id=run_id,
+        identity=identity,
+        state=outcome,
+        now_iso=now_iso,
+        existing=existing,
+    )
+    new_version = {
+        "run_id": run_id,
+        "path": str(version_path),
+        "report_path": str(report_path) if report_path is not None else None,
+        "finished_at": now_iso,
+        "outcome": outcome,
+        "tasks_pass": tasks_pass,
+        "tasks_fail": tasks_fail,
+        "deliverables": [dict(item) for item in deliverables or []],
+    }
+    versions = [new_version]
+    for version in entry["versions"]:
+        if version.get("run_id") != run_id:
+            versions.append(version)
+    entry["versions"] = versions[:ARTIFACT_LIBRARY_MAX_VERSIONS]
+    artifacts[run_name] = entry
+    write_artifact_library(state_dir, library)
+    prune_artifact_versions(state_dir, versions[ARTIFACT_LIBRARY_MAX_VERSIONS:])
+
+
+def prune_artifact_versions(state_dir: Path, versions: list[dict[str, Any]]) -> None:
+    root = artifacts_dir(state_dir).resolve()
+    for version in versions:
+        for key in ("path", "report_path"):
+            raw = version.get(key)
+            if not raw:
+                continue
+            path = Path(str(raw)).expanduser()
+            with contextlib.suppress(OSError):
+                resolved = path.resolve()
+                if resolved == root or root not in resolved.parents:
+                    continue
+                if resolved.is_file():
+                    resolved.unlink()
+                    with contextlib.suppress(OSError):
+                        resolved.parent.rmdir()
+
+
+def reconcile_artifact_library_dead_runs(state_dir: Path) -> None:
+    library = read_artifact_library(state_dir)
+    artifacts = library.get("artifacts", {})
+    if not isinstance(artifacts, dict):
+        return
+    active = read_active_runs()
+    changed = False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for entry in artifacts.values():
+        if not isinstance(entry, dict) or entry.get("state") != "live":
+            continue
+        run_id = str(entry.get("current_run_id", ""))
+        if not run_id or run_id not in active:
+            entry["state"] = "died"
+            entry["updated_at"] = now_iso
+            changed = True
+    if changed:
+        write_artifact_library(state_dir, library)
 
 
 def scan_run_states(state_dir: Path) -> list[dict[str, Any]]:
@@ -812,22 +1466,22 @@ def scan_run_states(state_dir: Path) -> list[dict[str, Any]]:
 
 
 STATUS_COLORS = {
-    "pass": "#49e27d",
-    "fail": "#ff5468",
-    "error": "#ff5468",
-    "timeout": "#ff5468",
-    "running": "#28d7ff",
-    "retrying": "#28d7ff",
-    "verifying": "#ffbe45",
-    "queued": "#778195",
-    "died": "#ff5468",
-    "live": "#28d7ff",
-    "finished": "#49e27d",
+    "pass": "var(--pass)",
+    "fail": "var(--fail)",
+    "error": "var(--fail)",
+    "timeout": "var(--fail)",
+    "running": "var(--running)",
+    "retrying": "var(--running)",
+    "verifying": "var(--running)",
+    "queued": "var(--waiting)",
+    "died": "var(--fail)",
+    "live": "var(--running)",
+    "finished": "var(--pass)",
 }
 
 
 def status_color(status: str) -> str:
-    return STATUS_COLORS.get(str(status).lower(), "#778195")
+    return STATUS_COLORS.get(str(status).lower(), "var(--waiting)")
 
 
 def fmt_duration(seconds: Any) -> str:
@@ -852,214 +1506,1381 @@ def fmt_datetime(value: str) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def fmt_compact_duration(seconds: Any) -> str:
+    try:
+        total = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        total = 0
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    parts: list[str] = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    if s or not parts:
+        parts.append(f"{s}s")
+    return " ".join(parts)
+
+
+def fmt_plain_ago(seconds: Any) -> str:
+    try:
+        total = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        total = 0
+    if total < 60:
+        return f"{total} second{'s' if total != 1 else ''}"
+    minutes, seconds_left = divmod(total, 60)
+    if minutes < 60:
+        if seconds_left == 0:
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        return (
+            f"{minutes} minute{'s' if minutes != 1 else ''} "
+            f"{seconds_left} second{'s' if seconds_left != 1 else ''}"
+        )
+    hours, minutes_left = divmod(minutes, 60)
+    if minutes_left == 0:
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    return (
+        f"{hours} hour{'s' if hours != 1 else ''} "
+        f"{minutes_left} minute{'s' if minutes_left != 1 else ''}"
+    )
+
+
 ARTIFACT_BASE_CSS = """
+  :root {
+    color-scheme: dark;
+    --ground: #0b0e14;
+    --surface: #141a26;
+    --ink: #e9eef7;
+    --muted: #8fa0b6;
+    --hairline: rgba(143, 160, 182, .22);
+    --accent: #35d0ff;
+    --pass: #45d17e;
+    --fail: #ff5f6b;
+    --waiting: #6f7c92;
+    --quote-bg: rgba(255, 95, 107, .08);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --ground: #f2f5f9;
+      --surface: #ffffff;
+      --ink: #17202e;
+      --muted: #5a6a7e;
+      --hairline: rgba(90, 106, 126, .28);
+      --accent: #007fb0;
+      --pass: #178a4c;
+      --fail: #cc3340;
+      --waiting: #7d8ba0;
+      --quote-bg: rgba(204, 51, 64, .07);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground: #0b0e14; --surface: #141a26; --ink: #e9eef7; --muted: #8fa0b6;
+    --hairline: rgba(143,160,182,.22); --accent: #35d0ff; --pass: #45d17e;
+    --fail: #ff5f6b; --waiting: #6f7c92; --quote-bg: rgba(255,95,107,.08);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --ground: #f2f5f9; --surface: #ffffff; --ink: #17202e; --muted: #5a6a7e;
+    --hairline: rgba(90,106,126,.28); --accent: #007fb0; --pass: #178a4c;
+    --fail: #cc3340; --waiting: #7d8ba0; --quote-bg: rgba(204,51,64,.07);
+  }
   * { box-sizing: border-box; }
   html, body {
-    margin: 0; min-height: 100%;
-    background: linear-gradient(180deg, #080a0f 0%, #0d1119 60%, #080a0f 100%);
-    color: #eef4ff;
+    margin: 0;
+    min-height: 100%;
+    overflow-x: hidden;
+    background: var(--ground);
+    color: var(--ink);
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.5;
   }
-  .wrap { max-width: 1200px; margin: 0 auto; padding: 22px 18px 48px; }
-  h1 { font-size: 21px; letter-spacing: .02em; text-transform: uppercase; margin: 0 0 4px; }
-  .meta { color: #8f9db2; font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin-bottom: 16px; line-height: 1.7; }
-  .meta b { color: #cbd6e8; }
+  body {
+    padding: clamp(18px, 4vw, 52px);
+  }
+  .page {
+    max-width: 860px;
+    margin: 0 auto;
+  }
+  .corner {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: clamp(14px, 3vw, 26px);
+  }
+  .live-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--accent);
+    align-self: center;
+    flex: 0 0 9px;
+  }
+  .live-dot.pass { background: var(--pass); }
+  .live-dot.fail, .live-dot.retry { background: var(--fail); }
+  .live-dot.waiting { background: var(--waiting); }
+  @media (prefers-reduced-motion: no-preference) {
+    .live-dot.is-live { animation: pulse 1.4s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: .35; } }
+  }
+  .eyebrow {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+  }
+  .eyebrow b {
+    color: var(--ink);
+  }
+  .clock {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .briefing {
+    max-width: 30ch;
+    margin: 0 0 clamp(16px, 3vw, 24px);
+    font-size: clamp(20px, 3.4vw, 30px);
+    font-weight: 800;
+    letter-spacing: 0;
+    line-height: 1.25;
+    text-wrap: balance;
+  }
+  .briefing .n-pass { color: var(--pass); }
+  .briefing .n-fail { color: var(--fail); }
+  .rounds {
+    display: flex;
+    gap: 5px;
+    margin-bottom: 8px;
+  }
+  .rounds span {
+    flex: 1;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--waiting);
+    opacity: .45;
+  }
+  .rounds .pass { background: var(--pass); opacity: 1; }
+  .rounds .working { background: var(--accent); opacity: 1; }
+  .rounds .retry, .rounds .fail { background: var(--fail); opacity: 1; }
+  @media (prefers-reduced-motion: no-preference) {
+    .rounds .working, .rounds .retry { animation: pulse 1.4s ease-in-out infinite; }
+  }
+  .legend {
+    margin: 0;
+    margin-bottom: clamp(26px, 5vw, 40px);
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .work {
+    margin-bottom: clamp(28px, 5vw, 44px);
+  }
+  .work-list {
+    display: grid;
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .work-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .work-main {
+    min-width: 0;
+  }
+  .work-link {
+    color: var(--ink);
+    font-size: 15px;
+    font-weight: 750;
+  }
+  .work-kind {
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .work-task {
+    display: inline-block;
+    margin-left: 6px;
+  }
+  .work-thumb-link {
+    flex: 0 0 auto;
+  }
+  .work-thumb {
+    display: block;
+    max-width: 132px;
+    max-height: 96px;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    object-fit: cover;
+  }
+  .work.is-primary .work-list {
+    gap: 12px;
+  }
+  .work.is-primary .work-item {
+    align-items: center;
+    padding: 16px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+  .work.is-primary .work-link {
+    font-size: clamp(17px, 2.6vw, 22px);
+  }
+  section h2 {
+    margin: 0 0 4px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--hairline);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+  }
+  .timeline {
+    margin-bottom: clamp(28px, 5vw, 44px);
+  }
+  details.timeline > summary {
+    cursor: pointer;
+    list-style: none;
+  }
+  details.timeline > summary::-webkit-details-marker { display: none; }
+  details.timeline > summary h2::after {
+    content: " ▸";
+    color: var(--muted);
+    font-size: 11px;
+  }
+  details.timeline[open] > summary h2::after { content: " ▾"; }
+  details.timeline > summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .tl-row {
+    display: grid;
+    grid-template-columns: 76px minmax(0,1fr);
+    gap: 14px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--hairline);
+    font-size: 14px;
+  }
+  .tl-row time {
+    color: var(--muted);
+    font-size: 12px;
+    padding-top: 2px;
+  }
+  .tl-row .catch {
+    margin: 6px 0 0;
+    padding: 8px 12px;
+    background: var(--quote-bg);
+    border-left: 2px solid var(--fail);
+    border-radius: 0 6px 6px 0;
+    color: var(--muted);
+    font-size: 13px;
+    overflow-wrap: break-word;
+  }
+  .tl-row .catch b {
+    color: var(--fail);
+    font-weight: 650;
+  }
+  .workers {
+    margin-bottom: clamp(28px, 5vw, 44px);
+  }
+  .worker {
+    display: grid;
+    grid-template-columns: 18px minmax(0,1fr) auto auto;
+    gap: 4px 12px;
+    align-items: baseline;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .glyph {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    align-self: center;
+  }
+  .glyph.pass { background: var(--pass); }
+  .glyph.working { background: var(--accent); }
+  .glyph.retry, .glyph.fail { background: var(--fail); }
+  .glyph.waiting {
+    background: transparent;
+    border: 1.5px solid var(--waiting);
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .glyph.working, .glyph.retry { animation: pulse 1.4s ease-in-out infinite; }
+  }
+  .worker .name {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 15px;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .worker .state {
+    font-size: 13px;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+  .state.pass { color: var(--pass); }
+  .state.working { color: var(--accent); }
+  .state.retry, .state.fail { color: var(--fail); }
+  .state.waiting { color: var(--waiting); }
+  .worker .time {
+    color: var(--muted);
+    font-size: 12.5px;
+    white-space: nowrap;
+  }
+  .worker .activity {
+    grid-column: 2 / -1;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .worker .verified {
+    grid-column: 2 / -1;
+    min-width: 0;
+    color: var(--muted);
+    font-size: 13px;
+    overflow-wrap: break-word;
+  }
+  .worker .proof {
+    grid-column: 2 / -1;
+    min-width: 0;
+    font-size: 12px;
+  }
+  .worker .proof summary {
+    cursor: pointer;
+    color: var(--accent);
+  }
+  .worker .proof pre {
+    margin: 6px 0 0;
+    padding: 10px 12px;
+    max-height: 200px;
+    overflow: auto;
+    border-left: 2px solid var(--hairline);
+    background: var(--surface);
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .worker .links {
+    grid-column: 2 / -1;
+    font-size: 13px;
+  }
+  .worker .links a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .worker .links a:hover,
+  .worker .links a:focus-visible {
+    text-decoration: underline;
+  }
+  .runs {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .omitted-note,
+  .empty-note {
+    max-width: 65ch;
+    margin: 8px 0 0;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .run-row {
+    display: grid;
+    gap: 16px;
+    align-items: center;
+    padding: 12px 0;
+    border-top: 1px solid var(--hairline);
+  }
+  .run-row {
+    grid-template-columns: minmax(0, 1.35fr) minmax(112px, .55fr) minmax(76px, .4fr) minmax(150px, .8fr);
+  }
+  .run-name {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--ink);
+    font-weight: 700;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .run-state {
+    color: var(--state-color);
+    font-weight: 800;
+  }
+  .run-duration {
+    color: var(--muted);
+  }
+  .run-links {
+    display: flex;
+    min-width: 0;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+  }
+  .run-links .muted {
+    color: var(--muted);
+  }
+  .state-pass { --state-color: var(--pass); }
+  .state-fail { --state-color: var(--fail); }
+  .state-running { --state-color: var(--accent); }
+  .state-waiting { --state-color: var(--waiting); }
+  .meta {
+    max-width: 65ch;
+    margin: 0 0 18px;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.55;
+  }
+  .meta b { color: var(--ink); }
+  .mono,
+  time {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  .muted { color: var(--muted); }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,.08); vertical-align: top; }
-  th { color: #8f9db2; font-weight: 700; text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
-  tr:hover td { background: rgba(255,255,255,.025); }
-  .chip { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 800; text-transform: uppercase; color: #080a0f; white-space: nowrap; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; color: #cbd6e8; }
-  .muted { color: #8f9db2; }
-  .spec { max-width: 340px; color: #b8c4d6; }
-  details { margin-top: 6px; }
-  summary { cursor: pointer; color: #35d5ff; font-size: 11px; }
-  pre { white-space: pre-wrap; word-break: break-word; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 8px; font-size: 11px; max-height: 320px; overflow: auto; margin: 6px 0 0; }
-  a { color: #35d5ff; text-decoration: none; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+  th { color: var(--muted); font-weight: 700; font-size: 10px; letter-spacing: 0; }
+  .chip { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 10px; font-weight: 800; color: var(--ground); white-space: nowrap; }
+  pre {
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    overflow: auto;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--ink);
+    padding: clamp(14px,3vw,24px);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  footer,
+  .page-foot {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .top-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: middle; box-shadow: 0 0 14px currentColor; }
+  @media (max-width: 640px) {
+    .worker,
+    .run-row {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 6px;
+    }
+    .glyph {
+      display: none;
+    }
+    .worker .activity,
+    .worker .links {
+      grid-column: 1 / -1;
+    }
+    .work-item,
+    .work.is-primary .work-item {
+      align-items: flex-start;
+      padding: 12px 0;
+      border-width: 0 0 1px;
+      border-radius: 0;
+      background: transparent;
+    }
+    .work-thumb {
+      max-width: 96px;
+      max-height: 72px;
+    }
+    .run-links {
+      gap: 6px 12px;
+    }
+  }
 """
 
 
-def render_status_html(state: dict[str, Any]) -> str:
-    """Tier 0 zero-LLM live status artifact. Rendered on every state flush (~1s)."""
-    run_name = html_escape(str(state.get("run_name", "ringer")))
-    identity = html_escape(str(state.get("identity", "unknown")))
-    run_state = str(state.get("state", "live"))
-    dot_color = status_color(run_state)
-    started = fmt_datetime(str(state.get("started_at", "")))
-    elapsed = fmt_duration(state.get("elapsed_s"))
-    totals = state.get("totals") or {}
-    pass_n = totals.get("pass", state.get("pass", 0))
-    fail_n = totals.get("fail", state.get("fail", 0))
-    done_n = totals.get("done", pass_n + fail_n)
-    tasks = state.get("tasks") or []
-    task_count = len(tasks)
-    max_parallel = state.get("max_parallel", "?")
-    tokens = int(totals.get("tokens", state.get("tokens", 0)) or 0)
+def file_href(path: Path) -> str:
+    try:
+        return path.resolve().as_uri()
+    except ValueError:
+        return "file://" + urllib.parse.quote(str(path))
 
-    rows = "".join(render_status_row(task) for task in tasks) or (
-        '<tr><td colspan="6" class="muted">no tasks</td></tr>'
-    )
 
-    report_note = ""
-    if state.get("report_ready") and state.get("report_path"):
-        report_path = str(state["report_path"])
-        report_note = (
-            f'<p class="meta">Final report ready: '
-            f'<a href="file://{html_escape(report_path)}">{html_escape(report_path)}</a></p>'
+def sanitize_artifact_name(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")
+    return sanitized or "artifact"
+
+
+def is_html_artifact(path: Path) -> bool:
+    return path.suffix.lower() in {".html", ".htm"}
+
+
+def deliverable_title(path: Path) -> str:
+    name = path.name.lower()
+    if name == "worker.log":
+        return "Work log"
+    if name in TASK_REPORT_FILENAMES:
+        return "What this worker produced"
+    stem = path.stem.replace("_", " ").replace("-", " ").strip()
+    return stem.capitalize() if stem else "Worker output"
+
+
+class ArtifactRenderer:
+    def __init__(self, artifact_path: Path) -> None:
+        self.artifact_dir = artifact_path.parent
+        self._wrapper_cache: dict[tuple[Path, Path], tuple[int, int]] = {}
+        self._last_task_status: dict[str, str] = {}
+        self._last_run_state: str | None = None
+        self._seen_transition_keys: set[tuple[str, str]] = set()
+        self._transition_log: list[dict[str, str]] = []
+
+    def render_status_html(self, state: dict[str, Any], *, page_path: Path | None = None) -> str:
+        return render_status_html(state, renderer=self, force_wrappers=False, page_path=page_path)
+
+    def render_final_report_html(self, state: dict[str, Any], *, page_path: Path | None = None) -> str:
+        return render_final_report_html(state, renderer=self, force_wrappers=True, page_path=page_path)
+
+    def render_artifact_index_html(self, entries: list[dict[str, Any]]) -> str:
+        return render_artifact_index_html(entries, renderer=self, force_wrappers=False)
+
+    def transition_feed(self, state: dict[str, Any], *, limit: int | None = None) -> list[dict[str, str]]:
+        self.record_transitions(state)
+        if limit is None:
+            return list(reversed(self._transition_log))
+        return list(reversed(self._transition_log[-limit:]))
+
+    def omitted_transition_count(self, limit: int) -> int:
+        return max(0, len(self._transition_log) - limit)
+
+    def record_transitions(self, state: dict[str, Any]) -> None:
+        run_state = str(state.get("state", "live"))
+        if self._last_run_state is None:
+            if run_state == "live":
+                self._append_transition(("run", "live"), "Ringer started")
+        elif self._last_run_state != run_state and run_state == "finished":
+            self._append_transition(("run", "finished"), "Ringer finished")
+        self._last_run_state = run_state
+
+        current_status: dict[str, str] = {}
+        tasks = state.get("tasks") or []
+        if not isinstance(tasks, list):
+            tasks = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            task_key = str(task.get("key", "task"))
+            status = str(task.get("status", "queued"))
+            previous = self._last_task_status.get(task_key)
+            current_status[task_key] = status
+            if previous == status:
+                continue
+            event = plain_transition_event(task_key, previous, status, task)
+            if event:
+                self._append_transition((task_key, status), event)
+        self._last_task_status = current_status
+
+    def _append_transition(self, key: tuple[str, str], event: str | dict[str, str]) -> None:
+        if key in self._seen_transition_keys:
+            return
+        self._seen_transition_keys.add(key)
+        if isinstance(event, str):
+            event = {"line": event}
+        self._transition_log.append({"time": datetime.now().strftime("%H:%M:%S"), **event})
+
+    def link_for_source(
+        self,
+        source_path: Path,
+        *,
+        state: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        run_name: str | None = None,
+        task_key: str,
+        force: bool = False,
+    ) -> str:
+        if is_html_artifact(source_path):
+            return file_href(source_path)
+        if not source_path.exists():
+            return file_href(source_path)
+
+        wrapper_path = self.wrapper_path(
+            run_id=str(run_id or (state or {}).get("run_id") or "run"),
+            task_key=task_key,
+            source_name=source_path.name,
         )
+        self.write_wrapper(
+            source_path,
+            wrapper_path,
+            run_name=str(run_name or (state or {}).get("run_name") or "ringer"),
+            task_key=task_key,
+            force=force,
+        )
+        return file_href(wrapper_path)
 
-    refresh = "" if state.get("finished") else '<meta http-equiv="refresh" content="5">'
+    def wrapper_path(self, *, run_id: str, task_key: str, source_name: str) -> Path:
+        filename = f"{sanitize_artifact_name(task_key)}--{sanitize_artifact_name(source_name)}.html"
+        return self.artifact_dir / "view" / sanitize_artifact_name(run_id) / filename
+
+    def write_wrapper(
+        self,
+        source_path: Path,
+        wrapper_path: Path,
+        *,
+        run_name: str,
+        task_key: str,
+        force: bool = False,
+    ) -> None:
+        stat = source_path.stat()
+        cache_key = (source_path.resolve(), wrapper_path)
+        current = (stat.st_mtime_ns, stat.st_size)
+        if not force and wrapper_path.exists() and self._wrapper_cache.get(cache_key) == current:
+            return
+
+        html = render_file_wrapper_html(
+            source_path=source_path,
+            source_stat=stat,
+            run_name=run_name,
+            task_key=task_key,
+        )
+        atomic_write_text(wrapper_path, html)
+        self._wrapper_cache[cache_key] = current
+
+
+def render_file_wrapper_html(
+    *,
+    source_path: Path,
+    source_stat: os.stat_result,
+    run_name: str,
+    task_key: str,
+) -> str:
+    size = int(source_stat.st_size)
+    truncated = size > ARTIFACT_WRAPPER_TAIL_BYTES
+    start = max(0, size - ARTIFACT_WRAPPER_TAIL_BYTES)
+    with source_path.open("rb") as fh:
+        if start:
+            fh.seek(start)
+        raw = fh.read()
+    content = raw.decode("utf-8", errors="replace")
+    source_mtime = datetime.fromtimestamp(source_stat.st_mtime).astimezone().strftime(
+        "%Y-%m-%d %H:%M:%S %Z"
+    )
+    truncation_note = (
+        f" Showing the last <b>{ARTIFACT_WRAPPER_TAIL_BYTES:,}</b> bytes"
+        f" of <b>{size:,}</b>."
+        if truncated
+        else ""
+    )
+    title = html_escape(deliverable_title(source_path))
+    safe_run_name = html_escape(run_name)
+    safe_task_key = html_escape(task_key)
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>ringer &middot; {run_name}</title>
-{refresh}
+{CSP_META_TAG}
+<title>{title}</title>
 <style>{ARTIFACT_BASE_CSS}</style>
 </head>
 <body>
-<div class="wrap">
-  <h1><span class="top-dot" style="background:{dot_color};color:{dot_color}"></span>{run_name}</h1>
-  <div class="meta">
-    identity <b>{identity}</b> &middot; state <b>{html_escape(run_state)}</b> &middot;
-    started <b>{started}</b> &middot; elapsed <b>{elapsed}</b> &middot;
-    <b>{done_n}/{task_count}</b> done ({pass_n} pass / {fail_n} fail) &middot;
-    max_parallel <b>{max_parallel}</b> &middot; tokens <b>{tokens:,}</b>
-  </div>
-  {report_note}
-  <table>
-    <thead><tr><th>Task</th><th>Status</th><th>Attempts</th><th>Duration</th><th>Check</th><th>Spec</th></tr></thead>
-    <tbody>
-      {rows}
-    </tbody>
-  </table>
+<div class="page">
+  <header class="corner">
+    <span class="live-dot waiting" aria-hidden="true"></span>
+    <span class="eyebrow">Ringer &nbsp;·&nbsp; <b>{safe_run_name}</b> &nbsp;·&nbsp; {safe_task_key}</span>
+    <span class="clock mono">artifact</span>
+  </header>
+  <section class="timeline" aria-label="{title}">
+    <h1 class="briefing">{title}</h1>
+    <p class="meta">{safe_task_key} produced this on <b>{source_mtime}</b>.{truncation_note}</p>
+  </section>
+  <pre>{html_escape(content)}</pre>
 </div>
 </body>
 </html>
 """
 
 
-def render_status_row(task: dict[str, Any]) -> str:
-    status = str(task.get("status", "queued"))
-    verdict = task.get("verdict")
-    key = html_escape(str(task.get("key", "")))
-    color = status_color(status)
-    label = status if not verdict or verdict == "PASS" else f"{status} ({verdict})"
-    attempts = task.get("attempts", 0)
-    elapsed = fmt_duration(task.get("elapsed_s"))
-    check_rc = task.get("check_returncode")
-    check_rc_text = "—" if check_rc is None else str(check_rc)
-    check_cmd = html_escape(shorten(str(task.get("check", "")), 200))
-    spec_preview = html_escape(shorten(str(task.get("spec_short") or task.get("spec") or ""), 200))
-
-    fail_block = ""
-    if status == "fail" and str(task.get("check_output_tail", "")).strip():
-        output = html_escape(shorten(str(task.get("check_output_tail", "")), 2000))
-        fail_block = f"<details><summary>check output</summary><pre>{output}</pre></details>"
-
-    return f"""<tr>
-      <td class="mono">{key}</td>
-      <td><span class="chip" style="background:{color}">{html_escape(label)}</span></td>
-      <td>{attempts}</td>
-      <td class="mono">{elapsed}</td>
-      <td class="mono">rc={check_rc_text}<br>{check_cmd}</td>
-      <td class="spec">{spec_preview}{fail_block}</td>
-    </tr>"""
+def state_tasks(state: dict[str, Any]) -> list[dict[str, Any]]:
+    tasks = state.get("tasks") or []
+    if not isinstance(tasks, list):
+        return []
+    return [task for task in tasks if isinstance(task, dict)]
 
 
-def render_final_report_html(state: dict[str, Any]) -> str:
-    """Feature 4: self-contained final report, rendered once when a run finishes."""
+def collect_state_deliverables(state: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for task in state_tasks(state):
+        task_key = str(task.get("key", "task"))
+        deliverables = task.get("deliverables") or []
+        if not isinstance(deliverables, list):
+            continue
+        for item in deliverables:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            path = str(item.get("path", "")).strip()
+            if not name or not path:
+                continue
+            try:
+                size = int(item.get("bytes", 0) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            items.append(
+                {
+                    "task_key": task_key,
+                    "name": name,
+                    "path": path,
+                    "bytes": size,
+                }
+            )
+    return items
+
+
+def task_status_counts(state: dict[str, Any]) -> dict[str, int]:
+    tasks = state_tasks(state)
+    buckets = [task_state_bucket(str(task.get("status", "queued"))) for task in tasks]
+    pass_n = sum(1 for bucket in buckets if bucket == "pass")
+    fail_n = sum(1 for bucket in buckets if bucket == "fail")
+    running_n = sum(1 for bucket in buckets if bucket == "working")
+    retry_n = sum(1 for bucket in buckets if bucket == "retry")
+    waiting_n = sum(1 for bucket in buckets if bucket == "waiting")
+    return {
+        "total": len(tasks),
+        "pass": pass_n,
+        "fail": fail_n,
+        "running": running_n,
+        "retry": retry_n,
+        "waiting": waiting_n,
+    }
+
+
+def task_word(count: int) -> str:
+    return "task" if count == 1 else "tasks"
+
+
+def passed_phrase(count: int) -> str:
+    if count == 1:
+        return "1 finished and checked"
+    return f"{count} finished and checked"
+
+
+def failed_phrase(count: int) -> str:
+    if count == 1:
+        return "1 failed"
+    return f"{count} failed"
+
+
+def running_phrase(count: int) -> str:
+    if count == 1:
+        return "1 working"
+    return f"{count} working"
+
+
+def retry_phrase(count: int) -> str:
+    if count == 1:
+        return "1 sent back"
+    return f"{count} sent back"
+
+
+def waiting_phrase(count: int) -> str:
+    if count == 1:
+        return "1 is waiting"
+    return f"{count} are waiting"
+
+
+def live_briefing_sentence(state: dict[str, Any]) -> str:
+    return html_to_text(live_briefing_html(state))
+
+
+def live_briefing_html(state: dict[str, Any]) -> str:
+    counts = task_status_counts(state)
+    elapsed = fmt_plain_ago(state.get("elapsed_s"))
+    total = counts["total"]
+    if total == 0:
+        return f"Ringer has no tasks. Started {html_escape(elapsed)} ago."
+    parts = []
+    if counts["pass"]:
+        parts.append(f'<span class="n-pass">{html_escape(passed_phrase(counts["pass"]))}</span>')
+    if counts["running"]:
+        parts.append(html_escape(running_phrase(counts["running"])))
+    if counts["retry"]:
+        parts.append(f'<span class="n-fail">{html_escape(retry_phrase(counts["retry"]))}</span>')
+    if counts["waiting"]:
+        parts.append(html_escape(waiting_phrase(counts["waiting"])))
+    if counts["fail"]:
+        parts.append(f'<span class="n-fail">{html_escape(failed_phrase(counts["fail"]))}</span>')
+    status_sentence = join_plain_html_parts(parts)
+    return (
+        f"Ringer is working on {total} {task_word(total)} — "
+        f"{status_sentence}, started {html_escape(elapsed)} ago."
+    )
+
+
+def final_briefing_sentence(state: dict[str, Any]) -> str:
+    return html_to_text(final_briefing_html(state))
+
+
+def final_briefing_html(state: dict[str, Any]) -> str:
+    counts = task_status_counts(state)
+    total = counts["total"]
+    pass_n = counts["pass"]
+    fail_n = counts["fail"]
+    elapsed = fmt_compact_duration(state.get("elapsed_s"))
+    first = f"Ringer finished {total} {task_word(total)} in {elapsed}."
+    if fail_n == 0:
+        return f"{html_escape(first)} <span class=\"n-pass\">All {total} finished and checked.</span>"
+    return (
+        f"{html_escape(first)} <span class=\"n-pass\">{pass_n} finished and checked</span>, "
+        f"<span class=\"n-fail\">{fail_n} failed after retry.</span>"
+    )
+
+
+def join_plain_html_parts(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
+
+def html_to_text(value: str) -> str:
+    return re.sub(r"<[^>]+>", "", value)
+
+
+def plain_transition_line(
+    task_key: str,
+    previous_status: str | None,
+    status: str,
+    task: dict[str, Any],
+) -> str | None:
+    event = plain_transition_event(task_key, previous_status, status, task)
+    if not event:
+        return None
+    return event["line"]
+
+
+def plain_transition_event(
+    task_key: str,
+    previous_status: str | None,
+    status: str,
+    task: dict[str, Any],
+) -> dict[str, str] | None:
+    attempts = int(task.get("attempts") or 0)
+    timed_out = bool(task.get("check_timed_out")) or status == "timeout"
+    check_excerpt = first_check_output_line(task)
+    if status == "running" and previous_status in {None, "queued"}:
+        return {"line": f"{task_key} started"}
+    if status == "retrying":
+        if timed_out:
+            return {"line": f"{task_key} timed out — trying again"}
+        if check_excerpt:
+            return {
+                "line": f"{task_key} didn't finish cleanly — sent back to redo the work.",
+                "catch": check_excerpt,
+            }
+        return {"line": f"{task_key} did not finish cleanly — trying again"}
+    if status == "pass":
+        if attempts > 1:
+            return {"line": f"{task_key} passed on the second try, {fmt_compact_duration(task.get('elapsed_s'))}"}
+        return {"line": f"{task_key} finished and checked, {fmt_compact_duration(task.get('elapsed_s'))}"}
+    if status == "fail":
+        if timed_out:
+            return {"line": f"{task_key} timed out"}
+        if check_excerpt:
+            return {"line": f"{task_key} could not finish.", "catch": check_excerpt}
+        if attempts > 1:
+            return {"line": f"{task_key} failed after the second try"}
+        return {"line": f"{task_key} failed"}
+    if status == "timeout":
+        return {"line": f"{task_key} timed out"}
+    return None
+
+
+def first_check_output_line(task: dict[str, Any]) -> str:
+    raw = task.get("check_output_tail") or task.get("check_output") or ""
+    for line in str(raw).splitlines():
+        clean = line.strip()
+        if clean:
+            return shorten(clean, 120)
+    return ""
+
+
+def task_state_bucket(status: str) -> str:
+    status = str(status).lower()
+    if status == "pass":
+        return "pass"
+    if status in {"fail", "error", "timeout", "died"}:
+        return "fail"
+    if status == "retrying":
+        return "retry"
+    if status in {"running", "verifying"}:
+        return "working"
+    return "waiting"
+
+
+def task_state_word(status: str) -> str:
+    bucket = task_state_bucket(status)
+    if bucket == "pass":
+        return "finished & checked"
+    if bucket == "working":
+        return "working"
+    if bucket == "retry":
+        return "sent back — redoing"
+    if bucket == "fail":
+        return "failed"
+    return "waiting"
+
+
+def local_time_label() -> str:
+    return datetime.now().astimezone().strftime("%H:%M:%S %Z")
+
+
+def render_progress_bar(tasks: list[dict[str, Any]], counts: dict[str, int]) -> str:
+    segments = []
+    for task in tasks:
+        key = html_escape(str(task.get("key", "task")))
+        bucket = task_state_bucket(str(task.get("status", "queued")))
+        state_word = html_escape(task_state_word(str(task.get("status", "queued"))))
+        css_class = "" if bucket == "waiting" else f' class="{bucket}"'
+        segments.append(
+            f'<span{css_class} aria-label="{key}: {state_word}"></span>'
+        )
+    bar = "".join(segments) if segments else ""
+    legend_parts = []
+    if counts["pass"]:
+        legend_parts.append(f'{counts["pass"]} finished')
+    if counts["running"]:
+        legend_parts.append(f'{counts["running"]} working')
+    if counts["retry"]:
+        legend_parts.append(f'{counts["retry"]} sent back')
+    if counts["fail"]:
+        legend_parts.append(f'{counts["fail"]} failed')
+    if counts["waiting"]:
+        legend_parts.append(f'{counts["waiting"]} waiting')
+    legend = " · ".join(legend_parts) if legend_parts else "No tasks"
+    aria = (
+        f'{counts["total"]} tasks: {counts["pass"]} passed, {counts["running"]} working, '
+        f'{counts["retry"]} retrying, {counts["waiting"]} waiting, {counts["fail"]} failed'
+    )
+    return f"""<div class="rounds" role="img" aria-label="{html_escape(aria)}">{bar}</div>
+    <p class="legend">{html_escape(legend)}</p>"""
+
+
+def render_work_section(
+    state: dict[str, Any],
+    *,
+    renderer: ArtifactRenderer | None,
+    page_path: Path | None,
+    force_wrappers: bool = False,
+    primary: bool = False,
+) -> str:
+    items = collect_state_deliverables(state)
+    name_counts: dict[str, int] = {}
+    for entry in items:
+        name_counts[entry["name"]] = name_counts.get(entry["name"], 0) + 1
+    for entry in items:
+        entry["shared_name"] = name_counts.get(entry["name"], 0) > 1
+    section_class = "work is-primary" if primary else "work"
+    if not items:
+        body = '<p class="empty-note">Nothing delivered yet — the workers are still on it.</p>'
+    else:
+        rows = [
+            render_work_item(
+                item,
+                state=state,
+                renderer=renderer,
+                page_path=page_path,
+                force_wrappers=force_wrappers,
+            )
+            for item in items
+        ]
+        body = f'<div class="work-list">{"".join(rows)}</div>'
+    return f"""<section class="{section_class}" aria-labelledby="the-work-heading">
+    <h2 id="the-work-heading">The work</h2>
+    {body}
+  </section>"""
+
+
+def render_work_item(
+    item: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    renderer: ArtifactRenderer | None,
+    page_path: Path | None,
+    force_wrappers: bool = False,
+) -> str:
+    task_key = str(item.get("task_key", "task"))
+    name = str(item.get("name", "")).strip() or "work"
+    source_path = Path(str(item.get("path", "")))
+    label, kind = work_label_and_kind(name)
+    # When several tasks deliver a file with the same name (four personas each
+    # writing reaction.md), the filename stops identifying anything — lead
+    # with the task's name instead.
+    if item.get("shared_name"):
+        pretty_task = task_key.replace("-", " ").replace("_", " ").strip()
+        pretty_task = pretty_task[:1].upper() + pretty_task[1:]
+        label = f"{pretty_task} — {Path(name).stem.replace('-', ' ').replace('_', ' ')}"
+    href = work_item_href(
+        source_path,
+        state=state,
+        task_key=task_key,
+        renderer=renderer,
+        page_path=page_path,
+        force_wrappers=force_wrappers,
+    )
+    thumb = ""
+    if is_image_deliverable(source_path):
+        thumb_src = image_data_uri(source_path)
+        if thumb_src:
+            thumb = (
+                f'<a class="work-thumb-link" href="{html_escape(href)}">'
+                f'<img class="work-thumb" src="{html_escape(thumb_src)}" alt=""></a>'
+            )
+    return f"""<div class="work-item">
+      {thumb}
+      <div class="work-main">
+        <a class="work-link" href="{html_escape(href)}">{html_escape(label)}</a>
+        <div class="work-kind">{html_escape(kind)} <span class="work-task muted">{html_escape(task_key)}</span></div>
+      </div>
+    </div>"""
+
+
+def work_item_href(
+    source_path: Path,
+    *,
+    state: dict[str, Any],
+    task_key: str,
+    renderer: ArtifactRenderer | None,
+    page_path: Path | None,
+    force_wrappers: bool,
+) -> str:
+    if renderer is None:
+        return "#"
+    if is_text_deliverable(source_path) and source_path.exists():
+        wrapper_path = renderer.wrapper_path(
+            run_id=str(state.get("run_id") or "run"),
+            task_key=task_key,
+            source_name=source_path.name,
+        )
+        renderer.write_wrapper(
+            source_path,
+            wrapper_path,
+            run_name=str(state.get("run_name") or "ringer"),
+            task_key=task_key,
+            force=force_wrappers,
+        )
+        return artifact_relative_href(
+            wrapper_path,
+            page_path=page_path,
+            artifact_root=renderer.artifact_dir,
+        )
+    return artifact_relative_href(source_path, page_path=page_path, artifact_root=renderer.artifact_dir)
+
+
+def artifact_relative_href(target: Path, *, page_path: Path | None, artifact_root: Path) -> str:
+    try:
+        root = artifact_root.resolve()
+        resolved_target = target.resolve()
+        if resolved_target != root and root not in resolved_target.parents:
+            return "#"
+        start = (page_path.parent if page_path is not None else artifact_root).resolve()
+        rel = os.path.relpath(resolved_target, start)
+    except (OSError, ValueError):
+        return "#"
+    return urllib.parse.quote(Path(rel).as_posix(), safe="/._-~")
+
+
+def work_label_and_kind(name: str) -> tuple[str, str]:
+    path = Path(name)
+    stem = path.stem.replace("_", " ").replace("-", " ").strip()
+    pretty = stem[:1].upper() + stem[1:] if stem else "Work"
+    suffix = path.suffix.lower()
+    if suffix in {".html", ".htm"}:
+        kind = "web page"
+    elif suffix in IMAGE_DELIVERABLE_SUFFIXES:
+        kind = "image"
+    elif suffix in TEXT_DELIVERABLE_SUFFIXES:
+        kind = "document"
+    else:
+        kind = "download"
+    return f"{pretty} — {kind}", kind
+
+
+def is_text_deliverable(path: Path) -> bool:
+    return path.suffix.lower() in TEXT_DELIVERABLE_SUFFIXES
+
+
+def is_image_deliverable(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_DELIVERABLE_SUFFIXES
+
+
+def image_data_uri(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    guessed, _encoding = mimetypes.guess_type(str(path))
+    mime = guessed if guessed and guessed.startswith("image/") else "application/octet-stream"
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def render_status_updates(updates: list[dict[str, str]], *, omitted: int = 0) -> str:
+    if not updates:
+        return '<p class="muted">No updates yet.</p>'
+    items = []
+    for update in updates:
+        stamp = html_escape(str(update.get("time", "")))
+        line = html_escape(str(update.get("line", "")))
+        catch = str(update.get("catch", "")).strip()
+        catch_html = (
+            f'<p class="catch"><b>Caught:</b> {html_escape(catch)}</p>'
+            if catch
+            else ""
+        )
+        items.append(f'<div class="tl-row"><time class="mono">{stamp}</time><div>{line}{catch_html}</div></div>')
+    note = '<p class="omitted-note">earlier updates omitted</p>' if omitted else ""
+    return "".join(items) + note
+
+
+def render_corner_header(state: dict[str, Any], *, live: bool) -> str:
     run_name = html_escape(str(state.get("run_name", "ringer")))
     identity = html_escape(str(state.get("identity", "unknown")))
-    started = fmt_datetime(str(state.get("started_at", "")))
-    elapsed = fmt_duration(state.get("elapsed_s"))
-    totals = state.get("totals") or {}
-    pass_n = totals.get("pass", state.get("pass", 0))
-    fail_n = totals.get("fail", state.get("fail", 0))
-    tasks = state.get("tasks") or []
-    task_count = len(tasks)
-    tokens = int(totals.get("tokens", state.get("tokens", 0)) or 0)
-    max_parallel = state.get("max_parallel", "?")
-    overall = "PASS" if fail_n == 0 else "FAIL"
-    overall_color = status_color("pass" if fail_n == 0 else "fail")
-    run_id = html_escape(str(state.get("run_id", "")))
+    elapsed = html_escape(fmt_compact_duration(state.get("elapsed_s")))
+    dot_class = "live-dot is-live" if live else f"live-dot {final_dot_bucket(state)}"
+    clock_label = f"{elapsed} elapsed" if live else f"{elapsed} total"
+    return f"""<header class="corner">
+    <span class="{dot_class}" aria-hidden="true"></span>
+    <span class="eyebrow">Ringer &nbsp;·&nbsp; <b>{run_name}</b> &nbsp;·&nbsp; {identity}</span>
+    <span class="clock mono">{clock_label}</span>
+  </header>"""
 
-    rows = "".join(render_report_row(task) for task in tasks) or (
-        '<tr><td colspan="8" class="muted">no tasks</td></tr>'
-    )
+
+def final_dot_bucket(state: dict[str, Any]) -> str:
+    counts = task_status_counts(state)
+    if counts["fail"]:
+        return "fail"
+    if counts["pass"]:
+        return "pass"
+    return "waiting"
+
+
+def render_status_html(
+    state: dict[str, Any],
+    renderer: ArtifactRenderer | None = None,
+    *,
+    force_wrappers: bool = False,
+    page_path: Path | None = None,
+) -> str:
+    """Tier 0 zero-LLM live status artifact. Rendered on every state flush (~1s)."""
+    run_name = html_escape(str(state.get("run_name", "ringer")))
+    tasks = state_tasks(state)
+    counts = task_status_counts(state)
+    briefing = live_briefing_html(state)
+    updates = renderer.transition_feed(state, limit=50) if renderer else []
+    omitted = renderer.omitted_transition_count(50) if renderer else 0
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+{CSP_META_TAG}
+<title>ringer &middot; {run_name}</title>
+<meta http-equiv="refresh" content="2">
+<style>{ARTIFACT_BASE_CSS}</style>
+</head>
+<body>
+<div class="page">
+  {render_corner_header(state, live=True)}
+  <h1 id="right-now-heading" class="briefing">{briefing}</h1>
+  {render_progress_bar(tasks, counts)}
+  {render_work_section(state, renderer=renderer, page_path=page_path, force_wrappers=force_wrappers)}
+  <section class="timeline" aria-labelledby="status-updates-heading">
+    <h2 id="status-updates-heading">What's happening</h2>
+    {render_status_updates(updates, omitted=omitted)}
+  </section>
+  {render_task_strip(tasks, state=state, renderer=renderer, force_wrappers=force_wrappers, page_path=page_path)}
+  <footer>
+    <span class="mono">Updated {html_escape(local_time_label())}</span>
+    <span>·</span>
+    <span>This page updates itself while the work runs.</span>
+  </footer>
+</div>
+</body>
+</html>
+"""
+
+
+def render_final_report_html(
+    state: dict[str, Any],
+    renderer: ArtifactRenderer | None = None,
+    *,
+    force_wrappers: bool = True,
+    page_path: Path | None = None,
+) -> str:
+    """Feature 4: self-contained final report, rendered once when a run finishes."""
+    run_name = html_escape(str(state.get("run_name", "ringer")))
+    tasks = state_tasks(state)
+    counts = task_status_counts(state)
+    briefing = final_briefing_html(state)
+    updates = renderer.transition_feed(state, limit=50) if renderer else []
+    omitted = renderer.omitted_transition_count(50) if renderer else 0
 
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{CSP_META_TAG}
 <title>ringer report &middot; {run_name}</title>
 <style>{ARTIFACT_BASE_CSS}</style>
 </head>
 <body>
-<div class="wrap">
-  <h1><span class="top-dot" style="background:{overall_color};color:{overall_color}"></span>{run_name} &mdash; final report</h1>
-  <div class="meta">
-    identity <b>{identity}</b> &middot; overall <b>{overall}</b> &middot;
-    started <b>{started}</b> &middot; elapsed <b>{elapsed}</b> &middot;
-    <b>{pass_n}/{task_count}</b> pass ({fail_n} fail) &middot;
-    max_parallel <b>{max_parallel}</b> &middot; tokens <b>{tokens:,}</b> &middot;
-    run_id <span class="mono">{run_id}</span>
-  </div>
-  <table>
-    <thead><tr>
-      <th>Task</th><th>Verdict</th><th>Attempts</th><th>Duration</th><th>Tokens</th>
-      <th>Check</th><th>Spec preview</th><th>Links</th>
-    </tr></thead>
-    <tbody>
-      {rows}
-    </tbody>
-  </table>
-  <p class="meta">Generated by ringer.py (zero-LLM Tier 0 artifact) at run completion. Spec text
-  is truncated to 200 chars in this report by design (task specs may embed paths from other
-  tasks); see the task's own worker.log / report files linked above for full detail.</p>
+<div class="page">
+  {render_corner_header(state, live=False)}
+  <h1 id="what-happened-heading" class="briefing">What happened — {briefing}</h1>
+  {render_work_section(state, renderer=renderer, page_path=page_path, force_wrappers=force_wrappers, primary=True)}
+  <details class="timeline">
+    <summary><h2 id="status-updates-heading">What happened along the way</h2></summary>
+    {render_status_updates(updates, omitted=omitted)}
+  </details>
+  {render_task_strip(tasks, state=state, renderer=renderer, force_wrappers=force_wrappers, page_path=page_path)}
+  <footer>
+    <span class="mono">Finished {html_escape(local_time_label())}</span>
+  </footer>
 </div>
 </body>
 </html>
 """
 
 
-def render_report_row(task: dict[str, Any]) -> str:
+def render_task_strip(
+    tasks: list[dict[str, Any]],
+    *,
+    state: dict[str, Any],
+    renderer: ArtifactRenderer | None = None,
+    force_wrappers: bool = False,
+    page_path: Path | None = None,
+) -> str:
+    rows = "".join(
+        render_task_item(task, state=state, renderer=renderer, force_wrappers=force_wrappers, page_path=page_path)
+        for task in tasks
+    )
+    if not rows:
+        rows = '<p class="empty-note">No tasks.</p>'
+    return f"""<section class="workers" aria-labelledby="tasks-heading">
+    <h2 id="tasks-heading">The workers</h2>
+    {rows}
+  </section>"""
+
+
+def render_task_item(
+    task: dict[str, Any],
+    *,
+    state: dict[str, Any] | None = None,
+    renderer: ArtifactRenderer | None = None,
+    force_wrappers: bool = False,
+    page_path: Path | None = None,
+) -> str:
     status = str(task.get("status", "queued"))
-    verdict = str(task.get("verdict") or status.upper())
-    color = status_color(status)
     key = html_escape(str(task.get("key", "")))
-    attempts = task.get("attempts", 0)
-    retried = " (retried)" if isinstance(attempts, int) and attempts > 1 else ""
-    elapsed = fmt_duration(task.get("elapsed_s"))
-    tokens = task.get("tokens")
-    tokens_text = "—" if tokens is None else f"{int(tokens):,}"
-    check_rc = task.get("check_returncode")
-    check_rc_text = "—" if check_rc is None else str(check_rc)
-    check_cmd = html_escape(shorten(str(task.get("check", "")), 300))
-    spec_preview = html_escape(shorten(str(task.get("spec_short") or task.get("spec") or ""), 200))
-    output = html_escape(shorten(str(task.get("check_output_tail", "")), 4000))
-    output_block = (
-        f"<details><summary>check output</summary><pre>{output}</pre></details>"
-        if output.strip()
+    bucket = task_state_bucket(status)
+    css_bucket = "working" if bucket == "working" else bucket
+    state_word = html_escape(task_state_word(status))
+    elapsed = html_escape(fmt_compact_duration(task.get("elapsed_s")))
+    activity = task_activity_line(task, bucket)
+    activity_html = (
+        f'<span class="activity" title="{html_escape(activity)}">{html_escape(activity)}</span>'
+        if activity
         else ""
     )
+    links_html = render_task_links(
+        task,
+        state=state or {},
+        renderer=renderer,
+        force_wrappers=force_wrappers,
+        page_path=page_path,
+    )
 
+    # Close the trust loop for finished work: say in plain English what the
+    # check proved, and keep the raw evidence one click away.
+    verified_html = ""
+    verified_text = str(task.get("verified") or "").strip()
+    if verified_text and bucket in {"pass", "fail"}:
+        proof_tail = str(task.get("check_output_tail") or "").strip()
+        proof_html = (
+            f'<details class="proof"><summary>See the proof</summary>'
+            f"<pre>{html_escape(shorten(proof_tail, 1200))}</pre></details>"
+            if proof_tail
+            else ""
+        )
+        verified_html = (
+            f'<span class="verified">How it was checked: {html_escape(verified_text)}</span>'
+            f"{proof_html}"
+        )
+
+    return f"""<div class="worker">
+      <span class="glyph {css_bucket}" aria-hidden="true"></span>
+      <span class="name" title="{key}">{key}</span>
+      <span class="state {css_bucket}">{state_word}</span>
+      <span class="time mono">{elapsed}</span>
+      {activity_html}
+      {verified_html}
+      <span class="links">{links_html}</span>
+    </div>"""
+
+
+def task_activity_line(task: dict[str, Any], bucket: str) -> str:
+    if bucket not in {"working", "retry"}:
+        return ""
+    activity = task.get("activity") or task.get("last_action") or task.get("last-action") or ""
+    return str(activity).strip()
+
+
+def render_task_links(
+    task: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    renderer: ArtifactRenderer | None = None,
+    force_wrappers: bool = False,
+    page_path: Path | None = None,
+) -> str:
+
+    def portable(href_path: Path) -> str:
+        # A page viewed over http cannot follow file:// links — resolve
+        # anything inside the artifact store to a relative href instead.
+        if renderer is not None:
+            with contextlib.suppress(Exception):
+                resolved = href_path.resolve()
+                if resolved.is_relative_to(renderer.artifact_dir.resolve()):
+                    return artifact_relative_href(
+                        resolved, page_path=page_path, artifact_root=renderer.artifact_dir
+                    )
+        return file_href(href_path)
     links: list[str] = []
     taskdir_path: Path | None = None
     taskdir = task.get("taskdir")
     if taskdir:
         taskdir_path = Path(str(taskdir))
-        if taskdir_path.exists():
-            links.append(f'<a href="file://{html_escape(str(taskdir_path))}">taskdir</a>')
 
-    log_path = task.get("log_path")
-    worker_log = Path(str(log_path)) if log_path else None
-    if worker_log is None and taskdir_path is not None:
-        worker_log = taskdir_path / "worker.log"
-    if worker_log is not None and worker_log.exists():
-        links.append(f'<a href="file://{html_escape(str(worker_log))}">worker.log</a>')
+    task_key = str(task.get("key", "task"))
 
     report_paths = task.get("report_paths") or {}
     if not isinstance(report_paths, dict):
@@ -1070,22 +2891,35 @@ def render_report_row(task: dict[str, Any]) -> str:
         if report_file is None and taskdir_path is not None:
             report_file = taskdir_path / report_name
         if report_file is not None and report_file.exists():
-            links.append(f'<a href="file://{html_escape(str(report_file))}">{report_name}</a>')
-    links_html = " &middot; ".join(links) if links else '<span class="muted">—</span>'
+            if renderer:
+                renderer.link_for_source(report_file, state=state, task_key=task_key, force=force_wrappers)
+                href = portable(renderer.wrapper_path(run_id=str(state.get("run_id") or "run"), task_key=task_key, source_name=report_file.name)) if not is_html_artifact(report_file) else portable(report_file)
+            else:
+                href = file_href(report_file)
+            links.append(f'<a href="{html_escape(href)}">Read what it found</a>')
+            break
 
-    return f"""<tr>
-      <td class="mono">{key}</td>
-      <td><span class="chip" style="background:{color}">{html_escape(verdict)}</span></td>
-      <td>{attempts}{retried}</td>
-      <td class="mono">{elapsed}</td>
-      <td class="mono">{tokens_text}</td>
-      <td class="mono">rc={check_rc_text}<br>{check_cmd}{output_block}</td>
-      <td class="spec">{spec_preview}</td>
-      <td class="mono">{links_html}</td>
-    </tr>"""
+    log_path = task.get("log_path")
+    worker_log = Path(str(log_path)) if log_path else None
+    if worker_log is None and taskdir_path is not None:
+        worker_log = taskdir_path / "worker.log"
+    if worker_log is not None and worker_log.exists():
+        if renderer:
+            renderer.link_for_source(worker_log, state=state, task_key=task_key, force=force_wrappers)
+            href = portable(renderer.wrapper_path(run_id=str(state.get("run_id") or "run"), task_key=task_key, source_name=worker_log.name))
+        else:
+            href = file_href(worker_log)
+        links.append(f'<a href="{html_escape(href)}">view the work log</a>')
+
+    return " &middot; ".join(links) if links else '<span class="muted">—</span>'
 
 
-def render_artifact_index_html(entries: list[dict[str, Any]]) -> str:
+def render_artifact_index_html(
+    entries: list[dict[str, Any]],
+    renderer: ArtifactRenderer | None = None,
+    *,
+    force_wrappers: bool = False,
+) -> str:
     """Multi-run index: one pane of glass across every run under this state_dir."""
     rows = []
     for entry in entries:
@@ -1099,9 +2933,21 @@ def render_artifact_index_html(entries: list[dict[str, Any]]) -> str:
         links: list[str] = []
         artifact_path = entry.get("artifact_path")
         if artifact_path:
-            links.append(f'<a href="file://{html_escape(str(artifact_path))}">live</a>')
+            links.append(f'<a href="{html_escape(file_href(Path(str(artifact_path))))}">live</a>')
         if entry.get("report_ready") and entry.get("report_path"):
-            links.append(f'<a href="file://{html_escape(str(entry["report_path"]))}">report</a>')
+            report_path = Path(str(entry["report_path"]))
+            href = (
+                renderer.link_for_source(
+                    report_path,
+                    run_id=str(entry.get("run_id") or "run"),
+                    run_name=str(entry.get("run_name") or "ringer"),
+                    task_key="run",
+                    force=force_wrappers,
+                )
+                if renderer
+                else file_href(report_path)
+            )
+            links.append(f'<a href="{html_escape(href)}">report</a>')
         links_html = " &middot; ".join(links) if links else '<span class="muted">—</span>'
         rows.append(
             f"""<tr>
@@ -1118,6 +2964,7 @@ def render_artifact_index_html(entries: list[dict[str, Any]]) -> str:
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{CSP_META_TAG}
 <title>ringer &middot; all runs</title>
 <meta http-equiv="refresh" content="5">
 <style>{ARTIFACT_BASE_CSS}</style>
@@ -1136,6 +2983,310 @@ def render_artifact_index_html(entries: list[dict[str, Any]]) -> str:
 """
 
 
+def artifact_content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".html", ".htm"}:
+        return "text/html; charset=utf-8"
+    if suffix == ".json":
+        return "application/json; charset=utf-8"
+    guessed, _encoding = mimetypes.guess_type(str(path))
+    if guessed:
+        if guessed.startswith("text/"):
+            return f"{guessed}; charset=utf-8"
+        return guessed
+    return "application/octet-stream"
+
+
+def read_ringside_html() -> str:
+    try:
+        return RINGSIDE_HTML_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return """<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Ringside</title></head>
+<body><main id="app">dashboard/ringside.html is missing</main></body>
+</html>
+"""
+
+
+def send_response_body(
+    handler: BaseHTTPRequestHandler,
+    status: HTTPStatus,
+    body: bytes,
+    *,
+    content_type: str,
+    no_store: bool = False,
+) -> None:
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    if no_store:
+        handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def send_json_response(handler: BaseHTTPRequestHandler, data: dict[str, Any]) -> None:
+    body = json.dumps(data, sort_keys=True).encode("utf-8")
+    send_response_body(
+        handler,
+        HTTPStatus.OK,
+        body,
+        content_type="application/json; charset=utf-8",
+        no_store=True,
+    )
+
+
+def read_json_object(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return default
+    return data if isinstance(data, dict) else default
+
+
+def scan_hud_run_states(state_dir: Path, *, limit: int = 12) -> list[dict[str, Any]]:
+    runs_dir = state_dir / "runs"
+    try:
+        paths = [path for path in runs_dir.glob("*.json") if path.is_file()]
+    except OSError:
+        return []
+
+    def path_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    paths.sort(key=path_mtime, reverse=True)
+    runs: list[dict[str, Any]] = []
+    for path in paths[:limit]:
+        data = read_json_object(path, {})
+        if data:
+            runs.append(data)
+    return runs
+
+
+def read_active_runs_file() -> dict[str, Any]:
+    return read_json_object(active_runs_path(), {})
+
+
+def resolve_artifact_http_path(artifact_root: Path, request_path: str) -> Path | None:
+    if request_path == "/artifacts/library.json":
+        relative = "library.json"
+    elif request_path.startswith("/artifacts/"):
+        relative = request_path[len("/artifacts/") :]
+    else:
+        return None
+    if not relative:
+        return None
+    decoded = urllib.parse.unquote(relative)
+    root = artifact_root.resolve()
+    candidate = (root / decoded).resolve()
+    if candidate == root or root not in candidate.parents:
+        return None
+    return candidate
+
+
+def task_log_path_from_state(state_path: Path, task_key: str) -> Path | None:
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    for task in tasks:
+        if not isinstance(task, dict) or task.get("key") != task_key:
+            continue
+        log_path = task.get("log_path")
+        if isinstance(log_path, str) and log_path:
+            return Path(log_path)
+    return None
+
+
+def run_state_path_for_id(state_dir: Path, run_id: str) -> Path | None:
+    if not run_id:
+        return None
+    runs_root = (state_dir / "runs").resolve()
+    candidate = (runs_root / f"{run_id}.json").resolve()
+    if candidate.parent != runs_root:
+        return None
+    return candidate
+
+
+def hud_task_log_path(state_dir: Path, run_id: str, task_key: str) -> Path | None:
+    state_path = run_state_path_for_id(state_dir, run_id)
+    if state_path is None:
+        return None
+    state = read_json_object(state_path, {})
+    tasks = state.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    for task in tasks:
+        if not isinstance(task, dict) or task.get("key") != task_key:
+            continue
+        log_path = task.get("log_path")
+        if isinstance(log_path, str) and log_path:
+            return Path(log_path).expanduser()
+        taskdir = task.get("taskdir")
+        if isinstance(taskdir, str) and taskdir:
+            return Path(taskdir).expanduser() / "worker.log"
+    return None
+
+
+def serve_artifact_path(handler: BaseHTTPRequestHandler, artifact_root: Path, path: str) -> bool:
+    artifact_path = resolve_artifact_http_path(artifact_root, path)
+    if artifact_path is None:
+        return False
+    try:
+        if not artifact_path.is_file():
+            raise FileNotFoundError
+        body = artifact_path.read_bytes()
+    except (FileNotFoundError, OSError):
+        handler.send_error(HTTPStatus.NOT_FOUND)
+        return True
+    send_response_body(
+        handler,
+        HTTPStatus.OK,
+        body,
+        content_type=artifact_content_type(artifact_path),
+        no_store=True,
+    )
+    return True
+
+
+class PersistentHudServer:
+    def __init__(
+        self,
+        state_dir: Path,
+        preferred_port: int = DEFAULT_HUD_PORT,
+        *,
+        open_viewer: bool = True,
+    ) -> None:
+        self.state_dir = state_dir
+        self.preferred_port = preferred_port
+        self.open_viewer = open_viewer
+        self.httpd: ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+        self.port: int | None = None
+
+    def start(self) -> int:
+        state_dir = self.state_dir
+        artifact_root = artifacts_dir(state_dir)
+        preferred_port = self.preferred_port
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                path = urllib.parse.urlparse(self.path).path
+                if path == "/":
+                    body = read_ringside_html().encode("utf-8")
+                    send_response_body(
+                        self,
+                        HTTPStatus.OK,
+                        body,
+                        content_type="text/html; charset=utf-8",
+                    )
+                    return
+                if path == "/api/runs":
+                    send_json_response(
+                        self,
+                        {
+                            "runs": scan_hud_run_states(state_dir),
+                            "active": read_active_runs_file(),
+                        },
+                    )
+                    return
+                if path.startswith("/api/open-folder"):
+                    query = urllib.parse.urlparse(path).query
+                    params = urllib.parse.parse_qs(query)
+                    name = (params.get("artifact") or [""])[0]
+                    run_id = (params.get("run") or [""])[0]
+                    artifact_root_dir = (state_dir / "artifacts").resolve()
+                    target = artifact_root_dir / "deliverables"
+                    if run_id:
+                        target = target / sanitize_artifact_name(run_id)
+                    if not target.exists():
+                        target = artifact_root_dir
+                    try:
+                        resolved = target.resolve()
+                        if resolved != artifact_root_dir and artifact_root_dir not in resolved.parents:
+                            self.send_error(HTTPStatus.NOT_FOUND)
+                            return
+                        if sys.platform == "darwin":
+                            subprocess.Popen(["open", str(resolved)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            self.send_response(HTTPStatus.NO_CONTENT)
+                            self.end_headers()
+                        else:
+                            self.send_error(HTTPStatus.NOT_IMPLEMENTED)
+                    except Exception:
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                if path == "/api/library":
+                    # A run that died without cleanup must not sit "live"
+                    # forever in the rail — reconcile against real pids on read.
+                    with contextlib.suppress(Exception):
+                        reconcile_artifact_library_dead_runs(state_dir)
+                    send_json_response(
+                        self,
+                        read_json_object(artifact_library_path(state_dir), {"artifacts": {}}),
+                    )
+                    return
+                if path.startswith("/artifacts/"):
+                    if not serve_artifact_path(self, artifact_root, path):
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                if path.startswith("/logs/"):
+                    relative = path[len("/logs/") :]
+                    if "/" not in relative:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    run_id_raw, task_key_raw = relative.split("/", 1)
+                    run_id = urllib.parse.unquote(run_id_raw)
+                    task_key = urllib.parse.unquote(task_key_raw)
+                    log_path = hud_task_log_path(state_dir, run_id, task_key)
+                    if log_path is None or not log_path.is_file():
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    body = tail_file_text(log_path, max_bytes=WORKER_LOG_TAIL_BYTES).encode("utf-8")
+                    send_response_body(
+                        self,
+                        HTTPStatus.OK,
+                        body,
+                        content_type="text/plain; charset=utf-8",
+                        no_store=True,
+                    )
+                    return
+                self.send_error(HTTPStatus.NOT_FOUND)
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+        try:
+            self.httpd = ThreadingHTTPServer(("127.0.0.1", preferred_port), Handler)
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not start Ringside on 127.0.0.1:{preferred_port}; "
+                "that port is already in use. Use --port to choose another port."
+            ) from exc
+        self.port = int(self.httpd.server_address[1])
+        self.thread = threading.Thread(target=self.httpd.serve_forever, name="ringer-hud", daemon=True)
+        self.thread.start()
+        url = f"http://127.0.0.1:{self.port}"
+        if self.open_viewer:
+            with contextlib.suppress(Exception):
+                webbrowser.open(url)
+        print(f"Ringside: {url}", flush=True)
+        return self.port
+
+    def stop(self) -> None:
+        if self.httpd is not None:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+
+
 class Dashboard:
     def __init__(
         self,
@@ -1143,40 +3294,62 @@ class Dashboard:
         preferred_port: int,
         hud_app_path: Path | None = None,
         force_browser: bool = False,
+        open_viewer: bool = True,
     ) -> None:
         self.state_path = state_path
         self.preferred_port = preferred_port
         self.hud_app_path = hud_app_path
         self.force_browser = force_browser
+        self.open_viewer = open_viewer
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.port: int | None = None
 
     def start(self) -> int:
         state_path = self.state_path
+        artifact_root = state_path.parent.parent / "artifacts"
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 path = urllib.parse.urlparse(self.path).path
                 if path == "/":
                     body = read_dashboard_html().encode("utf-8")
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    send_response_body(
+                        self,
+                        HTTPStatus.OK,
+                        body,
+                        content_type="text/html; charset=utf-8",
+                    )
                     return
                 if path == "/state.json":
                     try:
                         body = state_path.read_bytes()
                     except FileNotFoundError:
-                        body = b'{"run_name":"ringer","identity":"unknown","started_at":"","tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"tokens":0}}'
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Cache-Control", "no-store")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                        body = b'{"run_name":"ringer","identity":"unknown","started_at":"","port":null,"dashboard_port":null,"tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"tokens":0}}'
+                    send_response_body(
+                        self,
+                        HTTPStatus.OK,
+                        body,
+                        content_type="application/json; charset=utf-8",
+                        no_store=True,
+                    )
+                    return
+                if path.startswith("/logs/"):
+                    task_key = urllib.parse.unquote(path[len("/logs/") :])
+                    log_path = task_log_path_from_state(state_path, task_key)
+                    if log_path is None:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    body = tail_file_text(log_path, max_bytes=WORKER_LOG_TAIL_BYTES).encode("utf-8")
+                    send_response_body(
+                        self,
+                        HTTPStatus.OK,
+                        body,
+                        content_type="text/plain; charset=utf-8",
+                        no_store=True,
+                    )
+                    return
+                if serve_artifact_path(self, artifact_root, path):
                     return
                 self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -1190,27 +3363,23 @@ class Dashboard:
             except OSError as exc:
                 last_error = exc
                 continue
-            self.port = port
+            self.port = int(self.httpd.server_address[1])
             break
         if self.httpd is None or self.port is None:
             raise RuntimeError(f"could not start dashboard: {last_error}")
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="ringer-dashboard", daemon=True)
         self.thread.start()
         url = f"http://localhost:{self.port}"
-        try:
-            if not self.force_browser and self.hud_app_path is not None and self.hud_app_path.exists():
-                subprocess.Popen(
-                    ["open", "-a", str(self.hud_app_path)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        # flush: under a pipe this line is block-buffered and only appears at
-        # process exit, making live runs look dashboard-less (MBP field report).
-        print(f"Dashboard: {url}", flush=True)
+        # Browser-first: the persistent hud (ensure_hud_running, called from the
+        # run path) is what the human watches. Only --browser opens this
+        # per-run page directly; the parked Tauri app is never auto-launched.
+        if self.open_viewer and self.force_browser:
+            open_in_browser(url)
+        # The persistent hud (:8700) is the one watch surface; this per-run
+        # server is an internal state/log feed. Only advertise it when the
+        # user explicitly chose the per-run page with --browser.
+        if self.force_browser:
+            print(f"Dashboard: {url}", flush=True)
         return self.port
 
     def stop(self) -> None:
@@ -1312,7 +3481,7 @@ class EvalLogger:
 class Verifier:
     async def verify(self, task: TaskSpec, taskdir: Path) -> VerifyResult:
         missing_files = tuple(
-            rel for rel in task.expect_files if not self._is_nonempty_file(taskdir / rel)
+            rel for rel in task.expect_files if not self._is_nonempty_file(self._expect_file_path(taskdir, rel))
         )
         check_returncode, check_timed_out, output = await self._run_check(task.check, taskdir)
         ok = not missing_files and not check_timed_out and check_returncode == 0
@@ -1341,6 +3510,12 @@ class Verifier:
             return path.is_file() and path.stat().st_size > 0
         except OSError:
             return False
+
+    @staticmethod
+    def _expect_file_path(taskdir: Path, path: str) -> Path:
+        candidate = Path(path).expanduser()
+        # Keep runtime verification aligned with lint's treatment of "~" paths.
+        return candidate if candidate.is_absolute() else taskdir / candidate
 
     @staticmethod
     async def _run_check(command: str, cwd: Path) -> tuple[int | None, bool, str]:
@@ -1443,6 +3618,12 @@ class RingerRunner:
                 self.dashboard.stop()
             self.logger.close()
             print_summary(self.run_id, self.runtimes)
+            # The post-run journey: tell a human exactly where the results live.
+            with contextlib.suppress(Exception):
+                if self.state_writer.artifact is not None and self.state_writer.artifact.enabled:
+                    results_page = artifact_live_path(self.state_writer.state_dir, self.manifest.run_name)
+                    print(f"\nYour results: {results_page}")
+                    print("Open it in a browser, or run './ringer.py hud' for the full Ringside view (http://127.0.0.1:8700).")
 
     async def kill_all_workers(self) -> None:
         procs = list(self.active_processes.values())
@@ -1486,6 +3667,7 @@ class RingerRunner:
                 duration_ms = int((time.monotonic() - attempt_started) * 1000)
                 self._log_attempt(runtime, current_spec, retrying, worker, verify, verdict, duration_ms)
                 if verdict == "PASS":
+                    self._harvest_deliverables_on_pass(runtime)
                     with self.lock:
                         runtime.status = "pass"
                         runtime.final_verdict = verdict
@@ -1504,6 +3686,45 @@ class RingerRunner:
                     runtime.final_verdict = verdict
                     runtime.ended_at_monotonic = time.monotonic()
                 return
+
+    def _harvest_deliverables_on_pass(self, runtime: TaskRuntime) -> None:
+        harvested: list[dict[str, Any]] = []
+        notes: list[str] = []
+        target_dir = artifact_deliverables_dir(
+            self.config.state_dir,
+            self.run_id,
+            runtime.task.key,
+        )
+        for expect_path in runtime.task.expect_files:
+            source = Verifier._expect_file_path(runtime.taskdir, expect_path)
+            try:
+                stat = source.stat()
+            except OSError:
+                continue
+            if not source.is_file():
+                continue
+            if stat.st_size > DELIVERABLE_MAX_BYTES:
+                notes.append(
+                    f"{source.name} was not copied because it is larger than 20 MB "
+                    f"({stat.st_size:,} bytes)."
+                )
+                continue
+            target = target_dir / source.name
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                copied_size = target.stat().st_size
+            except OSError as exc:
+                append_text(
+                    runtime.log_path,
+                    f"[ringer.py] deliverable copy failed for {source.name}: {exc}\n",
+                )
+                continue
+            harvested.append({"name": source.name, "path": str(target), "bytes": copied_size})
+        if harvested or notes:
+            with self.lock:
+                runtime.deliverables = harvested
+                runtime.deliverable_notes.extend(notes)
 
     async def _prepare_taskdir(self, runtime: TaskRuntime) -> tuple[bool, str | None]:
         taskdir = runtime.taskdir
@@ -1940,6 +4161,20 @@ def tail_lines(path: Path, line_count: int) -> list[str]:
     return text.splitlines()[-line_count:]
 
 
+def tail_file_text(path: Path, max_bytes: int) -> str:
+    if max_bytes <= 0 or not path.exists():
+        return ""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
 def tail_text(path: Path, max_bytes: int = 6000, line_count: int = 40) -> str:
     if not path.exists():
         return ""
@@ -2229,6 +4464,11 @@ def dry_run(
             print(f"    command: {shell_command_for_display(cmd)} < /dev/null")
 
 
+def print_lint_findings(findings: list[str]) -> None:
+    for finding in findings:
+        print(f"lint: {finding}")
+
+
 def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
     print("\nSummary")
     print(f"run_id: {run_id}")
@@ -2257,20 +4497,23 @@ def create_demo_manifest() -> Path:
         "tasks": [
             {
                 "key": "alpha",
-                "spec": "Create alpha.txt containing exactly: alpha ready",
-                "check": "test \"$(cat alpha.txt 2>/dev/null)\" = \"alpha ready\"",
+                "spec": "Create alpha.txt in the current working directory containing exactly: alpha ready. Do not write any other files.",
+                "check": "test \"$(cat alpha.txt 2>/dev/null)\" = \"alpha ready\" || { echo 'FAIL: alpha.txt missing or content is not alpha ready'; exit 1; }",
+                "verified": "alpha.txt exists and contains exactly the expected text",
                 "expect_files": ["alpha.txt"],
             },
             {
                 "key": "bravo",
-                "spec": "Create bravo.txt containing exactly: bravo ready",
-                "check": "test \"$(cat bravo.txt 2>/dev/null)\" = \"bravo ready\"",
+                "spec": "Create bravo.txt in the current working directory containing exactly: bravo ready. Do not write any other files.",
+                "check": "test \"$(cat bravo.txt 2>/dev/null)\" = \"bravo ready\" || { echo 'FAIL: bravo.txt missing or content is not bravo ready'; exit 1; }",
+                "verified": "bravo.txt exists and contains exactly the expected text",
                 "expect_files": ["bravo.txt"],
             },
             {
                 "key": "charlie",
-                "spec": "Create charlie.txt containing exactly: charlie ready",
-                "check": "test \"$(cat charlie.txt 2>/dev/null)\" = \"charlie ready\"",
+                "spec": "Create charlie.txt in the current working directory containing exactly: charlie ready. Do not write any other files.",
+                "check": "test \"$(cat charlie.txt 2>/dev/null)\" = \"charlie ready\" || { echo 'FAIL: charlie.txt missing or content is not charlie ready'; exit 1; }",
+                "verified": "charlie.txt exists and contains exactly the expected text",
                 "expect_files": ["charlie.txt"],
             },
         ],
@@ -2278,6 +4521,188 @@ def create_demo_manifest() -> Path:
     path = root / "ringer.json"
     path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return path
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def claude_root(project: bool) -> Path:
+    return (Path.cwd() if project else Path.home()) / ".claude"
+
+
+def ringer_skill_source() -> Path:
+    return repo_root() / ".claude" / "skills" / "ringer" / "SKILL.md"
+
+
+def ringer_hook_command(action: str) -> str:
+    hook_path = repo_root() / "hooks" / "ringer_nudge.py"
+    return f"python3 {shlex.quote(str(hook_path))} {action}"
+
+
+def backup_file(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup = path.with_name(f"{path.name}.bak-{stamp}")
+    shutil.copy2(path, backup)
+    return backup
+
+
+def load_settings(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"settings file is not valid JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"settings file must contain a JSON object: {path}")
+    return data
+
+
+def write_settings(path: Path, settings: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup_file(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def hook_command_contains(value: Any, needle: str = "ringer_nudge.py") -> bool:
+    return isinstance(value, dict) and needle in str(value.get("command", ""))
+
+
+def event_has_ringer_hook(groups: Any) -> bool:
+    if not isinstance(groups, list):
+        return False
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        handlers = group.get("hooks")
+        if isinstance(handlers, list) and any(hook_command_contains(handler) for handler in handlers):
+            return True
+    return False
+
+
+def merge_ringer_hook(settings: dict[str, Any], event: str, matcher: str, command: str) -> bool:
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("settings hooks field must be a JSON object")
+    groups = hooks.setdefault(event, [])
+    if not isinstance(groups, list):
+        raise ValueError(f"settings hooks.{event} field must be a JSON array")
+    if event_has_ringer_hook(groups):
+        return False
+    groups.append(
+        {
+            "matcher": matcher,
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                }
+            ],
+        }
+    )
+    return True
+
+
+def remove_ringer_hooks(settings: dict[str, Any]) -> int:
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return 0
+    removed = 0
+    for event in list(hooks):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            continue
+        kept_groups = []
+        for group in groups:
+            if not isinstance(group, dict):
+                kept_groups.append(group)
+                continue
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                kept_groups.append(group)
+                continue
+            kept_handlers = []
+            for handler in handlers:
+                if hook_command_contains(handler):
+                    removed += 1
+                else:
+                    kept_handlers.append(handler)
+            if kept_handlers:
+                new_group = dict(group)
+                new_group["hooks"] = kept_handlers
+                kept_groups.append(new_group)
+        if kept_groups:
+            hooks[event] = kept_groups
+        else:
+            del hooks[event]
+    if not hooks:
+        del settings["hooks"]
+    return removed
+
+
+def install_agent(project: bool = False) -> int:
+    root = claude_root(project)
+    skill_source = ringer_skill_source()
+    skill_target = root / "skills" / "ringer" / "SKILL.md"
+    if not skill_source.exists():
+        raise ValueError(f"ringer skill source not found: {skill_source}")
+    skill_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(skill_source, skill_target)
+
+    settings_path = root / "settings.json"
+    settings = load_settings(settings_path)
+    changed = False
+    changed |= merge_ringer_hook(
+        settings,
+        "PreToolUse",
+        "Bash",
+        ringer_hook_command("pre-bash"),
+    )
+    changed |= merge_ringer_hook(
+        settings,
+        "PostToolUse",
+        "Edit|Write",
+        ringer_hook_command("post-edit"),
+    )
+    if changed or not settings_path.exists():
+        write_settings(settings_path, settings)
+
+    scope = "project" if project else "user"
+    print(f"Installed ringer agent for {scope} scope.")
+    print(f"Skill: {skill_target}")
+    if changed:
+        print(f"Hooks: added PreToolUse Bash and PostToolUse Edit|Write in {settings_path}")
+    else:
+        print(f"Hooks: already present in {settings_path}")
+    return 0
+
+
+def uninstall_agent(project: bool = False) -> int:
+    root = claude_root(project)
+    settings_path = root / "settings.json"
+    removed_hooks = 0
+    if settings_path.exists():
+        settings = load_settings(settings_path)
+        removed_hooks = remove_ringer_hooks(settings)
+        if removed_hooks:
+            write_settings(settings_path, settings)
+
+    skill_dir = root / "skills" / "ringer"
+    removed_skill = False
+    if skill_dir.exists():
+        shutil.rmtree(skill_dir)
+        removed_skill = True
+
+    scope = "project" if project else "user"
+    print(f"Uninstalled ringer agent for {scope} scope.")
+    print(f"Hooks removed: {removed_hooks}")
+    print(f"Skill removed: {'yes' if removed_skill else 'no'}")
+    return 0
 
 
 async def run_manifest(
@@ -2294,7 +4719,91 @@ async def run_manifest(
         dashboard_enabled=dashboard_enabled,
         force_browser=force_browser,
     )
-    return await runner.run()
+    register_active_run(
+        runner.run_id,
+        identity,
+        manifest.run_name,
+        manifest.workdir,
+        started_at=runner.started_at,
+    )
+    try:
+        return await runner.run()
+    finally:
+        unregister_active_run(runner.run_id)
+
+
+def hud_is_alive(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/runs", timeout=0.4) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def open_in_browser(url: str) -> None:
+    # `open` is the reliable path on macOS; webbrowser can silently no-op
+    # depending on how the session was launched (observed during demo prep).
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def ensure_hud_running(config: AppConfig, *, open_browser: bool) -> None:
+    """Make sure the persistent Ringside page is up before a run starts.
+
+    The human should never have to remember a second command to watch the
+    fight: if no hud answers on the configured port, spawn one detached.
+    """
+    port = config.hud_port
+    url = f"http://127.0.0.1:{port}"
+    if not hud_is_alive(port):
+        log_path = config.state_dir / "hud.log"
+        with contextlib.suppress(Exception):
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("ab") as log_file:
+                subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), "hud", "--no-open", "--port", str(port)],
+                    stdout=log_file,
+                    stderr=log_file,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+        for _ in range(20):
+            if hud_is_alive(port):
+                break
+            time.sleep(0.15)
+    if open_browser and hud_is_alive(port):
+        open_in_browser(url)
+    print(f"Ringside: {url}", flush=True)
+
+
+def run_persistent_hud(config: AppConfig, *, port: int | None, open_viewer: bool) -> int:
+    chosen_port = port if port is not None else config.hud_port
+    if hud_is_alive(chosen_port):
+        url = f"http://127.0.0.1:{chosen_port}"
+        print(f"Ringside is already running: {url}")
+        if open_viewer:
+            open_in_browser(url)
+        return 0
+    server = PersistentHudServer(
+        config.state_dir,
+        preferred_port=chosen_port,
+        open_viewer=open_viewer,
+    )
+    server.start()
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\nRingside stopped.")
+        return 0
+    finally:
+        server.stop()
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2323,6 +4832,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--dry-run", action="store_true", help="print the plan without spawning codex")
 
+    lint_parser = subparsers.add_parser("lint", help="lint a ringer manifest")
+    lint_parser.add_argument("manifest", type=Path, help="path to ringer.json")
+
+    hud_parser = subparsers.add_parser("hud", help="start the persistent Ringside page in your browser")
+    hud_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    hud_parser.add_argument("--port", type=int, help=f"port to bind on 127.0.0.1 (default: {DEFAULT_HUD_PORT})")
+    hud_parser.add_argument("--no-open", action="store_true", help="start the server without opening a browser")
+
     demo_parser = subparsers.add_parser("demo", help="generate and run a 3-task toy manifest in /tmp")
     demo_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     demo_parser.add_argument("--max-parallel", type=int, help="override demo max_parallel")
@@ -2335,6 +4852,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable zero-LLM HTML status/report artifacts (see [artifact] in config.toml)",
     )
     demo_parser.add_argument("--dry-run", action="store_true", help="print the demo plan without spawning codex")
+
+    install_parser = subparsers.add_parser("install-agent", help="install the ringer Claude Code skill and hooks")
+    install_parser.add_argument("--project", action="store_true", help="install into ./.claude instead of ~/.claude")
+
+    uninstall_parser = subparsers.add_parser("uninstall-agent", help="remove the ringer Claude Code skill and hooks")
+    uninstall_parser.add_argument("--project", action="store_true", help="remove from ./.claude instead of ~/.claude")
     return parser
 
 
@@ -2345,13 +4868,35 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "install-agent":
+            return install_agent(project=args.project)
+        if args.command == "uninstall-agent":
+            return uninstall_agent(project=args.project)
+
+        if args.command == "lint":
+            manifest = Manifest.from_path(args.manifest)
+            findings = lint_manifest(manifest)
+            if findings:
+                print_lint_findings(findings)
+                return 1
+            print(f"lint: clean ({len(manifest.tasks)} tasks)")
+            return 0
+
         config = AppConfig.load(args.config)
+        if args.command == "hud":
+            return run_persistent_hud(
+                config,
+                port=args.port,
+                open_viewer=not args.no_open,
+            )
+
         if args.command == "demo":
             manifest_path = create_demo_manifest()
             print(f"Demo manifest: {manifest_path}")
         else:
             manifest_path = args.manifest
         manifest = Manifest.from_path(manifest_path).with_max_parallel(args.max_parallel)
+        print_lint_findings(lint_manifest(manifest))
         validate_manifest_engines(manifest, config)
         identity_start_paths = [manifest.workdir]
         if manifest.source_path is not None:
@@ -2369,6 +4914,8 @@ def main(argv: list[str] | None = None) -> int:
                 force_browser=args.browser,
             )
             return 0
+        if dashboard_enabled and not args.browser:
+            ensure_hud_running(config, open_browser=True)
         return asyncio.run(
             run_manifest(
                 manifest,

@@ -29,9 +29,23 @@ manifest.json ──▶ ringer.py ──▶ N parallel workers (codex exec, each
 
 ## Quickstart
 
+1. Get the repo:
+
 ```bash
 git clone https://github.com/NateBJones-Projects/ringer && cd ringer
 cp config.sample.toml ~/.config/ringer/config.toml   # optional — sane defaults without it
+```
+
+2. Teach your agent to route work through Ringer:
+
+```bash
+# optional but recommended: teach your agent to route work through ringer
+./ringer.py install-agent
+```
+
+3. Run the demo:
+
+```bash
 ./ringer.py demo                                      # 3 real workers, verified end to end
 ```
 
@@ -80,6 +94,35 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 | `worktrees` (run-level) | Give each task an isolated git worktree of `repo` so parallel workers can't collide |
 
 > **Worktree footgun:** on PASS the task's worktree is removed — including anything written inside it. In worktrees mode, worker logs live outside task worktrees in `workdir/logs/`; have workers write deliverables outside the worktree too, or have your `check` copy artifacts out before it exits 0.
+
+## Lint
+
+Lint checks a manifest for the mistakes that make swarms hard to trust: checks that cannot fail, silent checks, worktree deliverables that disappear, worker commits that die with deleted worktrees, serial fan-out, write collisions, and underspecified specs.
+
+```bash
+./ringer.py lint templates/review-swarm.json
+lint: clean (1 tasks)
+```
+
+`run` and `demo` also print any lint findings as non-blocking warnings after the manifest loads. They teach at the moment of use; they do not stop a run.
+
+A check that cannot fail is trusting the worker with extra steps.
+
+## Make your agent actually use this
+
+Between swarms, agents drift back to invisible inline work. Reminders decay, so enforcement ships with the product.
+
+Run one command:
+
+```bash
+./ringer.py install-agent
+```
+
+It installs the ringer skill — the orchestrator playbook — user-level for Claude Code, and registers two gentle hooks: a Bash hook that notices model-calling or harness commands running outside a live Ringer run, and an edit-loop hook that notices batch editing without a run. Each hook nudges ONCE per session, pointing the agent at the skill.
+
+The hooks never block anything. A user who says "just do it inline" is obeyed; uninstall with `./ringer.py uninstall-agent`.
+
+For CI and evals, `config.sample.toml` includes `[engines.mock]` so the enforcement stack can be tested without an API bill.
 
 ## Engines are pluggable
 

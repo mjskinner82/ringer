@@ -3,6 +3,7 @@ use serde_json::{Map, Number, Value};
 use std::{
     cmp::Ordering,
     env, fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Mutex,
     thread,
@@ -37,6 +38,7 @@ const DEFAULT_HEIGHT: f64 = 420.0;
 const MIN_WIDTH: f64 = 280.0;
 const MIN_HEIGHT: f64 = 220.0;
 const MINI_STRIP_HEIGHT: f64 = 34.0;
+const WORKER_LOG_TAIL_BYTES: u64 = 64 * 1024;
 
 #[derive(Default)]
 struct LayoutState {
@@ -124,72 +126,45 @@ fn resize_main_window<R: Runtime>(
     Ok(())
 }
 
-/// Feature 2 (embedded live artifact): read a Tier 0 HTML artifact ringer.py rendered to disk,
-/// so the frontend can embed it via `<iframe srcdoc>` without relaxing the webview CSP or
-/// touching the Tauri `asset:` protocol scope. Restricted to paths currently advertised by
-/// ringer run state (never an arbitrary path from the frontend).
+/// Read a Tier 0 HTML artifact ringer.py rendered to disk for callers that need raw HTML.
+/// The Ringside artifact view loads artifact files through Tauri's asset protocol instead.
+/// Restricted to canonical paths under `<state_dir>/artifacts`.
 #[tauri::command]
 fn read_artifact_html(path: String) -> Result<String, String> {
     let state_dir = load_state_dir();
     let requested = expand_path(&path);
-    let canonical_state_dir = state_dir
+    let canonical_artifacts_dir = state_dir
+        .join("artifacts")
         .canonicalize()
-        .map_err(|err| format!("state dir unavailable: {err}"))?;
+        .map_err(|err| format!("artifact dir unavailable: {err}"))?;
     let canonical_requested = requested
         .canonicalize()
         .map_err(|err| format!("artifact not found: {err}"))?;
-    if !is_advertised_artifact_path(&canonical_state_dir, &canonical_requested) {
-        return Err(
-            "refusing to read an artifact path not advertised by ringer state".to_string(),
-        );
+    if !canonical_requested.starts_with(&canonical_artifacts_dir) {
+        return Err("refusing to read a path outside the artifact library".to_string());
     }
     fs::read_to_string(canonical_requested).map_err(|err| err.to_string())
 }
 
-fn is_advertised_artifact_path(canonical_state_dir: &Path, canonical_requested: &Path) -> bool {
-    let canonical_runs_dir = match canonical_state_dir.join("runs").canonicalize() {
-        Ok(path) if path.starts_with(canonical_state_dir) => path,
-        _ => return false,
-    };
-    let entries = match fs::read_dir(&canonical_runs_dir) {
-        Ok(entries) => entries,
-        Err(_) => return false,
-    };
+#[tauri::command]
+fn read_worker_log(path: String) -> Result<String, String> {
+    let state_dir = load_state_dir();
+    let requested = expand_path(&path);
+    let canonical_requested = requested
+        .canonicalize()
+        .map_err(|err| format!("worker log not found: {err}"))?;
 
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(canonical_run_path) = path.canonicalize() else {
-            continue;
-        };
-        if !canonical_run_path.starts_with(&canonical_runs_dir) {
-            continue;
-        }
-        let Ok(data) = fs::read_to_string(canonical_run_path) else {
-            continue;
-        };
-        let Ok(run) = serde_json::from_str::<Value>(&data) else {
-            continue;
-        };
-        let Some(artifact_path) = run
-            .get("artifact_path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        else {
-            continue;
-        };
-        let Ok(canonical_artifact_path) = expand_path(artifact_path).canonicalize() else {
-            continue;
-        };
-        if canonical_artifact_path == canonical_requested {
-            return true;
-        }
+    if !worker_log_is_advertised(&state_dir, &canonical_requested)? {
+        return Err("refusing to read a worker log that was not advertised by a run".to_string());
     }
 
-    false
+    read_tail_utf8(&canonical_requested, WORKER_LOG_TAIL_BYTES)
+}
+
+#[tauri::command]
+fn read_artifact_library() -> Result<String, String> {
+    let path = load_state_dir().join("artifacts").join("library.json");
+    fs::read_to_string(path).map_err(|err| format!("artifact library unavailable: {err}"))
 }
 
 /// Feature 5 (settings panel): plain JSON file, not UserDefaults (this is Tauri, not Swift),
@@ -232,7 +207,9 @@ fn main() {
             hide_window,
             toggle_collapse,
             resize_main_window,
+            read_artifact_library,
             read_artifact_html,
+            read_worker_log,
             load_settings,
             save_settings
         ])
@@ -361,6 +338,77 @@ fn scan_runs(state_dir: &Path) -> Vec<Value> {
         })
     });
     runs.into_iter().map(|run| run.payload).collect()
+}
+
+fn worker_log_is_advertised(state_dir: &Path, requested: &Path) -> Result<bool, String> {
+    let runs_dir = state_dir.join("runs");
+    let entries = match fs::read_dir(&runs_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("runs dir unavailable: {err}")),
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(data) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        if run_advertises_worker_log(&value, requested) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn run_advertises_worker_log(value: &Value, requested: &Path) -> bool {
+    value
+        .get("tasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .any(|task| task_advertises_worker_log(task, requested))
+}
+
+fn task_advertises_worker_log(task: &Map<String, Value>, requested: &Path) -> bool {
+    if let Some(log_path) = string_value(task.get("log_path")) {
+        if canonical_path_matches(&expand_path(&log_path), requested) {
+            return true;
+        }
+    }
+
+    if let Some(taskdir) = string_value(task.get("taskdir")) {
+        if canonical_path_matches(&expand_path(&taskdir).join("worker.log"), requested) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn canonical_path_matches(path: &Path, requested: &Path) -> bool {
+    path.canonicalize()
+        .map(|candidate| candidate == requested)
+        .unwrap_or(false)
+}
+
+fn read_tail_utf8(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
+    let size = file.seek(SeekFrom::End(0)).map_err(|err| err.to_string())?;
+    let start = size.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|err| err.to_string())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 struct SortableRun {
