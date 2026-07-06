@@ -30,6 +30,13 @@ checks and raw logs support — no vibes, no worker self-reports.
   316s/~175k tok; final brand+market-test reskin 622s/~184k tok), both passed
   14-assertion content checks on attempt 1, including base64-embedding photos
   and honoring honesty-marker requirements. Codex remains the site-build lane.
+- 2026-07-06 — ringer.py feature batch (task_type field + enriched eval rows
+  + `models` scoreboard + hud single-tab fix; ~640-line diff incl. two new
+  test suites): substance passed on attempt 1 — its check printed PASS
+  (compile, all 16 suites, exact CLI aggregation contract) — but the run
+  recorded attempt 2 because of the expect_files-before-check harness bug
+  (see process lessons). Heavy single-file feature work against an exact
+  behavioral contract is squarely codex's lane.
 
 ## glm-5.2 via opencode (`openrouter/z-ai/glm-5.2`)
 
@@ -48,6 +55,17 @@ checks and raw logs support — no vibes, no worker self-reports.
   attempt 1, ~14.5k tokens each. The "execute these exact commands, do not
   improve them" spec pattern is fully reliable for glm-5.2.
 
+- 2026-07-06 — backfill/seed script for the model log (252-line stdlib CLI
+  with a run-state join, 3-level mapping precedence, never-overwrite and
+  idempotency rules): the artifact was CORRECT; the recorded FAIL was an
+  orchestrator check-fixture bug (a missing newline glued the fixture's last
+  row to a garbage line) plus the harness ordering bug below. Verified PASS
+  once the check was fixed. Tight behavior contracts in the spec work great
+  for glm — and read the raw logs before blaming the model.
+- 2026-07-06 — README/MODEL-NOTES docs + task_type sweep across 17 template
+  manifests: passed attempt 2; attempt 1 was lost to the harness ordering
+  bug, not model quality — the retry worker's log correctly diagnosed that
+  harness bug unprompted, impressive debugging from the cheap lane.
 - 2026-07-06 — milk-crate demo, full run: 4 independent buyer-persona
   reviews (focus group) all passed attempt 1 (~15k tokens, ~2¢ each) with an
   explicit VERDICT-block contract — persona work is squarely in glm's zone.
@@ -70,6 +88,22 @@ checks and raw logs support — no vibes, no worker self-reports.
   group lesson).
 
 ## Process lessons (cross-model)
+
+- 2026-07-06 — HARNESS BUG (fix in flight on feat/model-perf-log):
+  Verifier.verify evaluated expect_files BEFORE running the check, so any
+  check that itself creates/exports its deliverable (the worktree
+  patch-export pattern) failed attempt 1 with "missing expected files" even
+  when the check printed PASS. Cost 3 phantom retries in one run — and it
+  poisons first_try_pass_rate, the model log's routing signal. Until the
+  reorder lands on your checkout: have the WORKER write the declared
+  deliverable, or don't declare check-created files in expect_files. When
+  reading seeded scoreboard numbers, remember 2026-07-06 first-try rates
+  are depressed by this.
+- 2026-07-06 — the model log is now automatic: every attempt row carries
+  model/task_type/retry; `./ringer.py models` prints the scoreboard; 81
+  historical rows were seeded via scripts/backfill_model_log.py with a
+  hand-authored task-type mapping. Give every manifest task a task_type or
+  its evidence buckets as (untyped).
 
 - 2026-07-06 — a three-model "bakeoff" ran every task on the engine's
   hard-coded model: task keys said glm/gpt/kimi, but the opencode engine

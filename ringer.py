@@ -3814,10 +3814,10 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
 
 class Verifier:
     async def verify(self, task: TaskSpec, taskdir: Path) -> VerifyResult:
+        check_returncode, check_timed_out, output = await self._run_check(task.check, taskdir)
         missing_files = tuple(
             rel for rel in task.expect_files if not self._is_nonempty_file(self._expect_file_path(taskdir, rel))
         )
-        check_returncode, check_timed_out, output = await self._run_check(task.check, taskdir)
         ok = not missing_files and not check_timed_out and check_returncode == 0
         if missing_files:
             missing_message = f"[ringer] missing expected files: {', '.join(missing_files)}"
