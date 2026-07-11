@@ -7940,25 +7940,23 @@ def merge_ringer_hook(settings: dict[str, Any], event: str, matcher: str, comman
     groups = hooks.setdefault(event, [])
     if not isinstance(groups, list):
         raise ValueError(f"settings hooks.{event} field must be a JSON array")
+    kept_groups: list[Any] = []
     for group in groups:
         if not isinstance(group, dict):
+            kept_groups.append(group)
             continue
         handlers = group.get("hooks")
         if not isinstance(handlers, list):
+            kept_groups.append(group)
             continue
-        ringer_handlers = [handler for handler in handlers if hook_command_contains(handler)]
-        if not ringer_handlers:
-            continue
-        if len(handlers) == 1:
-            expected = {"type": "command", "command": command}
-            if group.get("matcher") == matcher and handlers[0] == expected:
-                return False
-            group["matcher"] = matcher
-            group["hooks"] = [expected]
-            return True
-        group["hooks"] = [handler for handler in handlers if not hook_command_contains(handler)]
-        break
-    groups.append(
+        kept_handlers = [handler for handler in handlers if not hook_command_contains(handler)]
+        if len(kept_handlers) == len(handlers):
+            kept_groups.append(group)
+        elif kept_handlers:
+            new_group = dict(group)
+            new_group["hooks"] = kept_handlers
+            kept_groups.append(new_group)
+    kept_groups.append(
         {
             "matcher": matcher,
             "hooks": [
@@ -7969,6 +7967,9 @@ def merge_ringer_hook(settings: dict[str, Any], event: str, matcher: str, comman
             ],
         }
     )
+    if kept_groups == groups:
+        return False
+    hooks[event] = kept_groups
     return True
 
 

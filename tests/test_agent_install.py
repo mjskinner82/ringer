@@ -134,6 +134,106 @@ class AgentInstallTests(unittest.TestCase):
         self.assertIn(str(self.home / ".local" / "share" / "ringer" / "hooks" / "ringer_nudge.py"), command)
         self.assertNotIn("/tmp/ringer/hooks", command)
 
+    def test_install_migrates_multiple_stale_ringer_groups_to_one_canonical_group(self) -> None:
+        settings_path = self.home / ".claude" / "settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [
+                            {
+                                "matcher": "Bash",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "python3 /tmp/old-checkout/hooks/ringer_nudge.py pre-bash",
+                                    }
+                                ],
+                            },
+                            {
+                                "matcher": "Bash",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "python3 /tmp/other-checkout/hooks/ringer_nudge.py pre-bash",
+                                    }
+                                ],
+                            },
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli("install-agent")
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        groups = self.read_settings()["hooks"]["PreToolUse"]
+        self.assertEqual(1, len(groups))
+        self.assertEqual("Bash", groups[0]["matcher"])
+        self.assertEqual(1, len(groups[0]["hooks"]))
+        command = groups[0]["hooks"][0]["command"]
+        self.assertIn(str(self.home / ".local" / "share" / "ringer" / "hooks" / "ringer_nudge.py"), command)
+        self.assertNotIn("/tmp/old-checkout", command)
+        self.assertNotIn("/tmp/other-checkout", command)
+
+    def test_install_strips_ringer_handler_from_mixed_group_without_leaving_empty_groups(self) -> None:
+        settings_path = self.home / ".claude" / "settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [
+                            {
+                                "matcher": "Bash",
+                                "hooks": [
+                                    {"type": "command", "command": "echo unrelated"},
+                                    {
+                                        "type": "command",
+                                        "command": "python3 /tmp/old-checkout/hooks/ringer_nudge.py pre-bash",
+                                    },
+                                ],
+                            },
+                            {
+                                "matcher": "Bash",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "python3 /tmp/old-checkout/hooks/ringer_nudge.py pre-bash",
+                                    },
+                                    {
+                                        "type": "command",
+                                        "command": "python3 /tmp/other-checkout/hooks/ringer_nudge.py pre-bash",
+                                    },
+                                ],
+                            },
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli("install-agent")
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        groups = self.read_settings()["hooks"]["PreToolUse"]
+        self.assertEqual(2, len(groups))
+        for group in groups:
+            self.assertNotEqual([], group["hooks"])
+        self.assertEqual("Bash", groups[0]["matcher"])
+        self.assertEqual([{"type": "command", "command": "echo unrelated"}], groups[0]["hooks"])
+        ringer_commands = [handler["command"] for handler in self.ringer_handlers(self.read_settings())]
+        pre_bash_commands = [command for command in ringer_commands if command.endswith(" pre-bash")]
+        self.assertEqual(1, len(pre_bash_commands))
+        self.assertIn(
+            str(self.home / ".local" / "share" / "ringer" / "hooks" / "ringer_nudge.py"),
+            pre_bash_commands[0],
+        )
+
     def test_install_preserves_unrelated_hooks_and_settings_keys(self) -> None:
         claude = self.home / ".claude"
         claude.mkdir()
