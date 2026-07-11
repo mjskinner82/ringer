@@ -2,21 +2,13 @@
 name: ringer
 description: >-
   Orchestrator playbook and routing rules for Ringer, the verified-swarm
-  delegation tool (ringer.py). TRIGGER — load BEFORE acting, not after —
-  whenever: you are about to run ANY script or command that calls a model or
-  drives a conversational/eval harness (probe, smoke test, simulation,
-  grader, persona conversation) outside a live Ringer run; you are about to
-  start an edit→test→edit loop or a batch of similar edits across files; you
-  are about to do a "quick check" that spawns a model or a CLI agent; you are
-  reviewing or diagnosing failed worker or model output; you catch yourself
-  thinking a task is "small enough to just do myself" — that thought IS the
-  trigger (a single task is a one-task manifest); or you are writing or
-  reviewing a manifest, choosing a swarm pattern (review swarm, fix swarm,
-  focus group, bakeoff, research-with-proof), picking a worker engine, or
-  debugging a failed run. SKIP only for: reading or searching files, git
-  operations, a one-file few-line ONE-SHOT edit (once — if you are back for a
-  second pass, that is a loop: TRIGGER), authoring prose/specs/docs straight
-  from your own context, or pure conversation.
+  delegation tool. Load before any model-calling script or conversational
+  harness; edit-test-edit loop or batch edit; quick check that launches a
+  model or CLI agent; failed worker diagnosis; manifest authoring or review;
+  swarm-pattern, engine, model, task-type, or effort selection; or Ringer run
+  debugging. A single task is a one-task manifest. Skip only for file reads
+  and searches, Git-only operations, one one-file few-line edit, prose or
+  documentation authored from current context, or pure conversation.
 ---
 
 # Ringer orchestrator playbook
@@ -244,6 +236,16 @@ per task via the manifest `engine` field. Defaults are deliberate:
   retry rescues. Then read `docs/MODEL-NOTES.md` (in the ringer repo) for
   the judgment the numbers can't carry. Routing is grounded in performance,
   not vibes (Jon directive 2026-07-06).
+- **Use the local Sol/Terra/Luna lanes explicitly.** Put the model in the
+  manifest `model` field and put reasoning effort in `engine_args`.
+  Use Sol for decomposition, architecture, check design, synthesis, and an
+  explicit rescue after a cheaper lane fails. Use Terra by default for
+  implementation, debugging, integration, and invariant-heavy review. Use
+  Luna only for bounded mechanical edits, renderer work, tests, and
+  verification with an exact check. If Luna appears to need high effort,
+  move the task to Terra instead. Recommended defaults are Sol xhigh, Terra
+  high, and Luna medium; lower effort only when the task and check make the
+  reduced risk explicit.
 - **"Show me the scoreboard" is one command.** When the human asks to see
   the model scoreboard, rankings, model costs, or "which models work best,"
   run `./ringer.py models --open` — it renders the full scoreboard (tiers,
@@ -255,6 +257,19 @@ per task via the manifest `engine` field. Defaults are deliberate:
   code-feature, code-fix, code-review, research, persona-review, site-build,
   image-gen, docs, probe, bakeoff, ...). Untyped tasks bucket as (untyped)
   and teach the scoreboard nothing; lint nudges you when it's missing.
+
+## Harness ownership and handoff
+
+- Use a Codex Goal as an optional outer completion contract, never as a
+  worker scheduler or substitute for executed checks.
+- Let Ringer exclusively own delegated work, worker worktrees, retries, and
+  worker verification while a run is active. Never invoke firstmate or
+  no-mistakes inside a Ringer manifest.
+- After the orchestrator integrates the verified output and the canonical
+  repository check passes, hand the committed feature branch to
+  no-mistakes exactly once for review, PR creation, and CI monitoring.
+- If no-mistakes surfaces a non-mechanical design decision, stop at its gate
+  and return the decision to the human. Do not start a competing repair loop.
 
 ## Worktrees-mode footguns (learned the hard way)
 

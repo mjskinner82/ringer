@@ -132,7 +132,9 @@ Run one command:
 ./ringer.py install-agent
 ```
 
-It installs the ringer skill — the orchestrator playbook — user-level for Claude Code, and registers two gentle hooks: a Bash hook that notices model-calling or harness commands running outside a live Ringer run, and an edit-loop hook that notices batch editing without a run. Each hook nudges ONCE per session, pointing the agent at the skill.
+It installs the Ringer skill at the universal `.agents` path, keeps Claude Code compatibility, and registers two gentle hooks for Claude Code and Codex.
+A Bash hook notices model-calling or harness commands running outside a live Ringer run, and an edit-loop hook notices batch editing without a run.
+Each hook nudges once per session, pointing the agent at the skill.
 
 The hooks never block anything. A user who says "just do it inline" is obeyed; uninstall with `./ringer.py uninstall-agent`.
 

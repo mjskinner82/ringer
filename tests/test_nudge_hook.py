@@ -44,12 +44,18 @@ class NudgeHookTests(unittest.TestCase):
             check=False,
         )
 
-    def pre_bash_payload(self, command: str, session_id: str = "session-1") -> dict[str, object]:
+    def pre_bash_payload(
+        self,
+        command: str,
+        session_id: str = "session-1",
+        cwd: str = "/tmp/session-work",
+    ) -> dict[str, object]:
         return {
             "session_id": session_id,
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
             "tool_input": {"command": command},
+            "cwd": cwd,
         }
 
     def post_edit_payload(
@@ -57,6 +63,7 @@ class NudgeHookTests(unittest.TestCase):
         file_path: str,
         session_id: str = "session-1",
         tool_name: str = "Edit",
+        cwd: str = "/tmp/session-work",
     ) -> dict[str, object]:
         return {
             "session_id": session_id,
@@ -64,6 +71,25 @@ class NudgeHookTests(unittest.TestCase):
             "tool_name": tool_name,
             "tool_input": {"file_path": file_path},
             "tool_response": {"success": True},
+            "cwd": cwd,
+        }
+
+    def codex_patch_payload(
+        self,
+        file_paths: list[str],
+        session_id: str = "codex-session",
+        cwd: str = "/tmp/session-work",
+    ) -> dict[str, object]:
+        patch_lines = ["*** Begin Patch"]
+        patch_lines.extend(f"*** Update File: {path}" for path in file_paths)
+        patch_lines.append("*** End Patch")
+        return {
+            "session_id": session_id,
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": "\n".join(patch_lines)},
+            "tool_response": {"success": True},
+            "cwd": cwd,
         }
 
     def assertNudged(self, proc: subprocess.CompletedProcess[str], event_name: str) -> None:
@@ -112,10 +138,25 @@ class NudgeHookTests(unittest.TestCase):
         proc = self.run_hook("pre-bash", self.pre_bash_payload("python3 ringer.py run manifest.json"))
         self.assertSilent(proc)
 
-    def test_pre_bash_stays_silent_when_active_run_has_live_pid(self) -> None:
-        self.write_active_run(os.getpid())
-        proc = self.run_hook("pre-bash", self.pre_bash_payload("node probe-simulate.mjs"))
+    def test_pre_bash_stays_silent_inside_active_run_workdir(self) -> None:
+        self.write_active_run(os.getpid(), "/tmp/live-ringer-work")
+        proc = self.run_hook(
+            "pre-bash",
+            self.pre_bash_payload("node probe-simulate.mjs", cwd="/tmp/live-ringer-work/task"),
+        )
         self.assertSilent(proc)
+
+    def test_unrelated_active_run_does_not_silence_session(self) -> None:
+        self.write_active_run(os.getpid(), "/tmp/live-ringer-work")
+        proc = self.run_hook(
+            "pre-bash",
+            self.pre_bash_payload(
+                "node probe-simulate.mjs",
+                session_id="unrelated-session",
+                cwd="/tmp/other-work",
+            ),
+        )
+        self.assertNudged(proc, "PreToolUse")
 
     def test_pre_bash_dedupes_per_session(self) -> None:
         first = self.run_hook("pre-bash", self.pre_bash_payload("node probe-simulate.mjs"))
@@ -146,6 +187,33 @@ class NudgeHookTests(unittest.TestCase):
         files = ["/tmp/a.py", "/tmp/b.py", "/tmp/a.py", "/tmp/b.py", "/tmp/a.py", "/tmp/b.py", "/tmp/a.py"]
         for file_path in files:
             self.assertSilent(self.run_hook("post-edit", self.post_edit_payload(file_path, "session-2")))
+
+    def test_codex_apply_patch_paths_count_as_distinct_files(self) -> None:
+        for _ in range(7):
+            payload = self.codex_patch_payload(
+                ["src/a.py", "src/b.py"],
+                session_id="codex-session",
+            )
+            self.assertSilent(self.run_hook("post-edit", payload))
+
+        nudged = self.run_hook(
+            "post-edit",
+            self.codex_patch_payload(
+                ["src/a.py", "src/b.py", "src/c.py"],
+                session_id="codex-session",
+            ),
+        )
+        self.assertNudged(nudged, "PostToolUse")
+
+    def test_post_edit_stays_silent_inside_active_run_workdir(self) -> None:
+        self.write_active_run(os.getpid(), "/tmp/live-ringer-work")
+        for index in range(8):
+            payload = self.post_edit_payload(
+                f"/tmp/live-ringer-work/file-{index}.py",
+                session_id="worker-session",
+                cwd="/tmp/live-ringer-work/task",
+            )
+            self.assertSilent(self.run_hook("post-edit", payload))
 
     def test_malformed_stdin_exits_zero_silently(self) -> None:
         proc = self.run_hook("pre-bash", "{not json")

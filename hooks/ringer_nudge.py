@@ -29,6 +29,10 @@ HARNESS_RE = re.compile(
     r"\.(?:mjs|js|ts|py)\b",
     re.IGNORECASE,
 )
+PATCH_PATH_RE = re.compile(
+    r"^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s*(.+?)\s*$",
+    re.MULTILINE,
+)
 
 
 def ringer_home() -> Path:
@@ -138,6 +142,27 @@ def command_references_active_workdir(command: str, active_runs: dict[str, dict[
     return False
 
 
+def path_is_inside(path: str, root: str) -> bool:
+    try:
+        Path(path).expanduser().resolve().relative_to(Path(root).expanduser().resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def payload_is_inside_active_workdir(
+    payload: dict[str, Any], active_runs: dict[str, dict[str, Any]]
+) -> bool:
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        return False
+    for entry in active_runs.values():
+        workdir = entry.get("workdir")
+        if isinstance(workdir, str) and workdir.strip() and path_is_inside(cwd, workdir):
+            return True
+    return False
+
+
 def should_nudge_pre_bash(payload: dict[str, Any], home: Path) -> bool:
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -151,7 +176,7 @@ def should_nudge_pre_bash(payload: dict[str, Any], home: Path) -> bool:
         return False
 
     active_runs = read_live_active_runs(home)
-    if active_runs:
+    if payload_is_inside_active_workdir(payload, active_runs):
         return False
     if command_references_active_workdir(command, active_runs):
         return False
@@ -178,17 +203,28 @@ def load_post_edit_state(path: Path) -> dict[str, Any]:
     return {"count": count, "file_paths": [str(path) for path in file_paths]}
 
 
+def edited_file_paths(payload: dict[str, Any]) -> set[str]:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return set()
+
+    files: set[str] = set()
+    file_path = tool_input.get("file_path")
+    if isinstance(file_path, str) and file_path.strip():
+        files.add(file_path.strip())
+
+    command = tool_input.get("command")
+    if isinstance(command, str):
+        files.update(match.strip() for match in PATCH_PATH_RE.findall(command) if match.strip())
+    return files
+
+
 def record_post_edit(payload: dict[str, Any], home: Path) -> tuple[int, int]:
     path = post_edit_state_path(home, payload.get("session_id"))
     state = load_post_edit_state(path)
     count = int(state["count"]) + 1
     files = set(str(item) for item in state["file_paths"])
-
-    tool_input = payload.get("tool_input")
-    if isinstance(tool_input, dict):
-        file_path = tool_input.get("file_path")
-        if isinstance(file_path, str) and file_path.strip():
-            files.add(file_path)
+    files.update(edited_file_paths(payload))
 
     next_state = {"count": count, "file_paths": sorted(files)}
     write_json_atomic(path, next_state)
@@ -196,10 +232,13 @@ def record_post_edit(payload: dict[str, Any], home: Path) -> tuple[int, int]:
 
 
 def should_nudge_post_edit(payload: dict[str, Any], home: Path) -> bool:
+    active_runs = read_live_active_runs(home)
+    if payload_is_inside_active_workdir(payload, active_runs):
+        return False
     count, distinct_files = record_post_edit(payload, home)
     if count < 8 or distinct_files < 3:
         return False
-    return not read_live_active_runs(home)
+    return True
 
 
 def load_stdin_payload() -> dict[str, Any] | None:
