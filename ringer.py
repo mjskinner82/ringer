@@ -811,6 +811,7 @@ class TaskRuntime:
     last_check_returncode: int | None = None
     last_check_timed_out: bool = False
     last_check_output: str = ""
+    failure_class: str | None = None
 
     def elapsed_s(self, now: float) -> float:
         if self.started_at_monotonic is None:
@@ -6907,17 +6908,30 @@ class RingerRunner:
                         runtime.ended_at_monotonic = time.monotonic()
                     await self._cleanup_worktree_on_pass(runtime)
                     return
-                if attempt < max_attempts and verdict in {"FAIL", "TIMEOUT"}:
+                decision = retry_decision(
+                    verdict, duration_ms, attempt, max_attempts, worker.returncode
+                )
+                if decision == "retry":
                     failure_context = build_failure_context(runtime.log_path, verify.raw_output_excerpt)
                     current_spec = (
                         f"{runtime.task.spec}\n\n"
                         f"Previous attempt failed: {failure_context}. Fix it."
                     )
                     continue
+                if decision == "terminal-launch":
+                    with self.lock:
+                        runtime.failure_class = "launch"
+                    append_text(
+                        runtime.log_path,
+                        f"[ringer.py] launch-class failure: worker exited after {duration_ms}ms, "
+                        "before real work could happen; an identical retry cannot succeed. "
+                        "Fix the engine, environment, or spec, then rerun.\n",
+                    )
                 with self.lock:
                     runtime.status = "fail"
                     runtime.final_verdict = verdict
                     runtime.ended_at_monotonic = time.monotonic()
+                self._record_task_escalation(runtime, verdict)
                 return
 
     def _harvest_deliverables_on_pass(self, runtime: TaskRuntime) -> None:
@@ -7066,6 +7080,33 @@ class RingerRunner:
         )
         worker = WorkerResult(returncode=None, timed_out=False, tokens=None, error=error)
         self._log_attempt(runtime, runtime.task.spec, False, worker, verify, "ERROR", 0)
+        with self.lock:
+            runtime.failure_class = "prepare"
+        self._record_task_escalation(runtime, "ERROR")
+
+    def _record_task_escalation(self, runtime: TaskRuntime, verdict: str) -> None:
+        # A task that ends non-PASS with nobody told is how work strands
+        # (2026-07-13: a review-fix chain died at 4:19 AM and sat invisible
+        # for 11 hours). The record survives the orchestrator's death.
+        append_escalation(
+            self.config.state_dir,
+            {
+                "logged_at": datetime.now(timezone.utc).isoformat(),
+                "run_id": self.run_id,
+                "task_key": runtime.task.key,
+                "verdict": verdict,
+                "failure_class": runtime.failure_class,
+                "attempts": runtime.attempts,
+                "check_excerpt": (runtime.last_check_output or "")[:400],
+                "log_path": str(runtime.log_path),
+            },
+        )
+        print(
+            f"[ringer.py] ESCALATION {runtime.task.key}: {verdict} after "
+            f"{runtime.attempts} attempt(s) [{runtime.failure_class or 'work'}-class]. "
+            "Recorded for `ringer.py status`; this task is stranded until someone acts.",
+            flush=True,
+        )
 
     async def _run_worker(self, runtime: TaskRuntime, spec: str, attempt: int) -> WorkerResult:
         log_path = runtime.log_path
@@ -7280,6 +7321,113 @@ def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:
     if verify.ok:
         return "PASS"
     return "FAIL"
+
+
+# A FAIL this fast means the worker exited before doing real work (auth,
+# sandbox denial, bad flag, missing binary) — an identical retry cannot
+# succeed (2026-07-13: four sub-3s FAIL/FAIL pairs burned slots in one run).
+LAUNCH_CLASS_THRESHOLD_MS = 10_000
+
+
+def launch_class_threshold_ms() -> int:
+    # Env override exists for harness tests that simulate instant failures
+    # (mock engine) and for operators whose workers legitimately finish fast.
+    raw = os.environ.get("RINGER_LAUNCH_CLASS_THRESHOLD_MS")
+    if raw is None:
+        return LAUNCH_CLASS_THRESHOLD_MS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return LAUNCH_CLASS_THRESHOLD_MS
+
+
+def retry_decision(
+    verdict: str,
+    duration_ms: int,
+    attempt: int,
+    max_attempts: int,
+    worker_returncode: int | None = None,
+) -> str:
+    """Classify the follow-up to a non-PASS attempt.
+
+    Returns "retry", "terminal", or "terminal-launch". Only FAIL and TIMEOUT
+    are retryable at all. A FAIL faster than LAUNCH_CLASS_THRESHOLD_MS with a
+    nonzero worker exit is a launch-class failure (the CLI died before doing
+    work) and terminates immediately so the environment or spec gets fixed
+    instead of replayed. A fast FAIL with exit 0 means the worker did work
+    that flunked the check — that retry is legitimate.
+    """
+    if attempt >= max_attempts or verdict not in {"FAIL", "TIMEOUT"}:
+        return "terminal"
+    if (
+        verdict == "FAIL"
+        and duration_ms < launch_class_threshold_ms()
+        and worker_returncode is not None
+        and worker_returncode != 0
+    ):
+        return "terminal-launch"
+    return "retry"
+
+
+def escalations_path(state_dir: Path) -> Path:
+    return state_dir / "escalations.jsonl"
+
+
+def append_escalation(state_dir: Path, record: dict[str, Any]) -> None:
+    path = escalations_path(state_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def read_escalations(state_dir: Path, limit: int = 50) -> list[dict[str, Any]]:
+    path = escalations_path(state_dir)
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            records.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            continue
+    return records[-limit:]
+
+
+def run_status_command(config: AppConfig, args: Any) -> int:
+    if getattr(args, "clear_escalations", False):
+        with contextlib.suppress(OSError):
+            escalations_path(config.state_dir).unlink()
+        print("escalations cleared")
+        return 0
+    active = read_active_runs()
+    if active:
+        print(f"active runs: {len(active)}")
+        for run_id, entry in sorted(active.items()):
+            label = entry.get("run_name") or run_id
+            print(f"  {label} ({run_id})")
+    else:
+        print("active runs: none")
+    escalations = read_escalations(config.state_dir)
+    if not escalations:
+        print("stranded escalations: none")
+        return 0
+    print(
+        f"stranded escalations: {len(escalations)} — resume or report each, "
+        "then acknowledge with --clear-escalations"
+    )
+    for record in escalations:
+        print(
+            f"  {record.get('logged_at', '?')} {record.get('run_id', '?')} "
+            f"{record.get('task_key', '?')}: {record.get('verdict', '?')} "
+            f"[{record.get('failure_class') or 'work'}-class] log={record.get('log_path', '?')}"
+        )
+    return 2
 
 
 def build_run_id(run_name: str) -> str:
@@ -8158,6 +8306,16 @@ def build_parser() -> argparse.ArgumentParser:
     hud_parser.add_argument("--port", type=int, help=f"port to bind on 127.0.0.1 (default: {DEFAULT_HUD_PORT})")
     hud_parser.add_argument("--no-open", action="store_true", help="start the server without opening a browser")
 
+    status_parser = subparsers.add_parser(
+        "status",
+        help="show active runs and stranded-task escalations (exit 2 when escalations exist)",
+    )
+    status_parser.add_argument(
+        "--clear-escalations",
+        action="store_true",
+        help="acknowledge and remove recorded escalations after acting on them",
+    )
+
     db_parser = subparsers.add_parser("db", help="manage the derived SQLite read model")
     db_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     db_subparsers = db_parser.add_subparsers(dest="db_command", required=True)
@@ -8238,6 +8396,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_catalog_command(args)
 
         config = AppConfig.load(args.config)
+        if args.command == "status":
+            return run_status_command(config, args)
         if args.command == "db":
             return run_db_command(config, args)
         if args.command == "models":

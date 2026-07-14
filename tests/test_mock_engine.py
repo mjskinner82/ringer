@@ -108,6 +108,9 @@ class MockEngineEndToEndTests(unittest.TestCase):
             env["HOME"] = str(home)
             env["RINGER_HOME"] = str(ringer_home)
             env["XDG_CONFIG_HOME"] = str(root / "xdg-config")
+            # The mock worker simulates an instant nonzero failure; disable the
+            # launch-class guard so this e2e keeps proving the retry path.
+            env["RINGER_LAUNCH_CLASS_THRESHOLD_MS"] = "0"
 
             proc = subprocess.run(
                 [
