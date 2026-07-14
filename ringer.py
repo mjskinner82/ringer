@@ -7581,14 +7581,17 @@ def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:
 
 
 # A FAIL this fast means the worker exited before doing real work (auth,
-# sandbox denial, bad flag, missing binary) — an identical retry cannot
+# sandbox denial, bad flag, missing binary). An identical retry cannot
 # succeed (2026-07-13: four sub-3s FAIL/FAIL pairs burned slots in one run).
 LAUNCH_CLASS_THRESHOLD_MS = 10_000
 
 
 def launch_class_threshold_ms() -> int:
-    # Env override exists for harness tests that simulate instant failures
-    # (mock engine) and for operators whose workers legitimately finish fast.
+    """Return the worker-time launch guard in milliseconds.
+
+    RINGER_LAUNCH_CLASS_THRESHOLD_MS overrides the 10,000 ms default. Integer
+    values clamp at zero, while non-integer values fall back to the default.
+    """
     raw = os.environ.get("RINGER_LAUNCH_CLASS_THRESHOLD_MS")
     if raw is None:
         return LAUNCH_CLASS_THRESHOLD_MS
@@ -7608,11 +7611,11 @@ def retry_decision(
     """Classify the follow-up to a non-PASS attempt.
 
     Returns "retry", "terminal", or "terminal-launch". Only FAIL and TIMEOUT
-    are retryable at all. A FAIL faster than LAUNCH_CLASS_THRESHOLD_MS with a
-    nonzero worker exit is a launch-class failure (the CLI died before doing
+    are retryable at all. A FAIL faster than launch_class_threshold_ms() with
+    a nonzero worker exit is a launch-class failure (the CLI died before doing
     work) and terminates immediately so the environment or spec gets fixed
     instead of replayed. A fast FAIL with exit 0 means the worker did work
-    that flunked the check — that retry is legitimate.
+    that flunked the check, so that retry is legitimate.
     """
     if attempt >= max_attempts or verdict not in {"FAIL", "TIMEOUT"}:
         return "terminal"
@@ -8722,7 +8725,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ringer.py",
         description=(
             "Ringer: deterministic parallel AI-agent orchestrator. Runs manifest tasks in parallel, "
-            "verifies artifacts with executed checks, retries failures once, logs eval rows, "
+            "verifies artifacts with executed checks, retries eligible failures once, logs eval rows, "
             "and serves a live dashboard."
         ),
     )
@@ -8736,7 +8739,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--identity", help="orchestrator identity for HUD state and eval rows")
     run_parser.add_argument("--no-dashboard", action="store_true", help="disable live dashboard")
     run_parser.add_argument("--browser", action="store_true", help="open the dashboard in the browser instead of Ringside")
-    run_parser.epilog = "Set RINGER_NO_CATALOG_REFRESH=1 to skip the non-blocking OpenRouter catalog auto-refresh."
+    run_parser.epilog = (
+        "Set RINGER_NO_CATALOG_REFRESH=1 to skip the non-blocking OpenRouter catalog "
+        "auto-refresh. Set RINGER_LAUNCH_CLASS_THRESHOLD_MS to tune the worker-time "
+        "launch guard in milliseconds; 0 disables it."
+    )
     run_parser.add_argument(
         "--no-artifact",
         action="store_true",
@@ -8754,12 +8761,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser(
         "status",
-        help="show active runs and stranded-task escalations (exit 2 when escalations exist)",
+        help="show active runs and stranded-task escalations (exit 2 while stranded work remains)",
     )
     status_parser.add_argument(
         "--clear-escalations",
         action="store_true",
         help="acknowledge escalations from the latest displayed status snapshot",
+    )
+    status_parser.epilog = (
+        "Exit 0 when no stranded work remains, 2 while escalations or pending dead-run "
+        "recovery remain, and 1 on persistence failure. Active runs are informational."
     )
 
     db_parser = subparsers.add_parser("db", help="manage the derived SQLite read model")

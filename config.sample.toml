@@ -7,8 +7,18 @@
 # value > short hostname.
 # identity_default = "codex-mini"
 
-# State files live under <state_dir>/runs/<run_id>.json.
+# Run state files live under <state_dir>/runs/<run_id>.json. Terminal non-PASS
+# task escalations append to <state_dir>/escalations.jsonl.
+# Plain `status` writes <state_dir>/escalations.jsonl.review.json so a later
+# clear acknowledges exactly the displayed records. The cross-run recovery
+# registry lives at <RINGER_HOME>/active-runs.json (default
+# ~/.ringer/active-runs.json).
 state_dir = "~/.ringer"
+
+# Environment override: a FAIL whose worker exits nonzero in less than 10,000
+# ms of worker time is launch-class and does not retry.
+# RINGER_LAUNCH_CLASS_THRESHOLD_MS accepts integer milliseconds; values below
+# 0 clamp to 0 and disable the guard, while non-integers use 10,000.
 
 # First localhost port tried for the per-run dashboard. The server will scan the
 # next 49 ports if this one is busy.
@@ -98,6 +108,8 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # token_regex = "\"total_tokens\"\\s*:\\s*([0-9]+)"
 
 # For CI, acceptance evals, and trying Ringer without an API bill.
+# Set RINGER_LAUNCH_CLASS_THRESHOLD_MS=0 when an instant nonzero mock failure
+# must exercise the retry path instead of the launch guard.
 # [engines.mock]
 # bin = "python3"
 # args_template = [
@@ -113,9 +125,12 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # default: GLM-5.2 (z-ai/glm-5.2, roughly $0.74/M input, $2.33/M output as of
 # 2026-07) — the cheap-intelligence lane.
 # OpenCode has no OS sandbox, so `bin` points at engines/opencode-sandboxed.sh
-# (macOS Seatbelt: network open; reads open except a credential deny-list,
-# extendable via ~/.config/ringer/opencode-deny-read.txt; writes confined to
-# the task dir, a per-run scratch dir, and OpenCode's state/config dirs). Auth: put your
+# (macOS Seatbelt: network open; reads open except a credential deny-list;
+# writes confined to the task dir, a per-run scratch dir, and OpenCode's
+# state/config dirs). Extend the read deny-list one path per line through
+# ~/.config/ringer/opencode-deny-read.txt, select another file with
+# RINGER_OPENCODE_DENY_READ_FILE, or add colon-separated paths with
+# RINGER_OPENCODE_DENY_READ. Auth: put your
 # OpenRouter key where your OpenCode version expects it — commonly
 # ~/.local/share/opencode/auth.json ({"openrouter": {"type": "api", "key": "..."}});
 # confirm the path with your installed CLI.

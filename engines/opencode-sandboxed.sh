@@ -78,8 +78,9 @@ SBEOF
 # inject rules. Missing paths are skipped.
 #
 # Machine-local additions (cloud drives, work directories, extra key stores):
-#   - one path per line in ~/.config/ringer/opencode-deny-read.txt
-#     ('#' comments and leading '~' both supported), or
+#   - one path per line in the file selected by RINGER_OPENCODE_DENY_READ_FILE
+#     (default ~/.config/ringer/opencode-deny-read.txt; '#' comments and leading
+#     '~' both supported), or
 #   - RINGER_OPENCODE_DENY_READ, colon-separated.
 DENY_READ_CANDIDATES=(
   "$HOME/.ssh"

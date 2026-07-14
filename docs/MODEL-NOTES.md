@@ -265,6 +265,8 @@ checks and raw logs support — no vibes, no worker self-reports.
   before blaming the model.
 - 2026-07-06 — opencode sqlite "database is locked" again with just 2
   simultaneous opencode spawns (page-news + page-about-faq); retry absorbed it.
+- 2026-07-13: The launch guard changes the current response to the two sqlite-lock observations above.
+  A `FAIL` with a nonzero worker exit under the default 10-second threshold now stops without retry, so stagger or repair OpenCode startup instead of expecting the retry lane to absorb it.
 
 ## codex (2026-07-06, bench-operator-proofing)
 - 8/8 code-feature tasks passed attempt 1 across 3 rounds (worktrees mode, Python harness refactor; 108k-406k tokens/task). Specs embedded the approved architecture doc + exact file ownership; checks built fresh uv venvs and ran the full pytest suite.
