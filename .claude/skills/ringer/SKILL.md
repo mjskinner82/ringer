@@ -21,7 +21,7 @@ description: >-
 
 # Ringer orchestrator playbook
 
-## Read this first — the four rules that actually get broken
+## Read this first: the five rules that actually get broken
 
 1. **You review; workers type.** Your lane: specs, checks, pattern choice,
    reading results. If you are typing implementation, running probes, or
@@ -47,13 +47,17 @@ description: >-
    your one-liner, not wondering if anything is happening. Never pass
    `--no-dashboard` except in automated tests or when the user explicitly
    asks.
+5. **Two strikes, then the human.**
+   When the same task or task family has failed two rounds, including a no-mistakes review round, a third identical attempt is forbidden.
+   Run `./ringer.py status`, then change the plan or escalate with the evidence.
+   Every stranded escalation from `status` must be resumed, re-planned, or reported before a new run starts.
 
 Ringer runs manifest tasks in parallel across cheap CLI workers (Codex,
 OpenCode/GLM, others via config) and verifies every task by **executing a
-check command** — exit 0 is the only PASS. Failed tasks are retried once
-with the check's actual failure output injected into the retry prompt. You —
-the orchestrating model — pay tokens only for specs, orchestration, and
-review.
+check command**; exit 0 is the only PASS.
+Retryable task failures run once more with the check's actual failure output injected into the retry prompt.
+A fast nonzero worker exit is a launch-class failure and stops without an identical retry.
+You, the orchestrating model, pay tokens only for specs, orchestration, and review.
 
 ```bash
 ./ringer.py lint manifest.json            # always lint before running
@@ -282,6 +286,9 @@ someone's untracked scratch files.
 
 ## Post-run review ritual
 
+0. Run `./ringer.py status`.
+   Exit 2 means stranded escalations exist, and each one must be resumed, re-planned, or reported before acknowledgement with `--clear-escalations`.
+   A launch-class escalation means the engine, environment, or spec must change before another run.
 1. Read the run JSON in `~/.ringer/runs/` — statuses, retries, durations.
 2. For any retried or failed task, read the raw worker log in
    `<workdir>/logs/` before deciding anything. Retries that passed on

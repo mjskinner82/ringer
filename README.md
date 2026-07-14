@@ -8,7 +8,12 @@ Frontier models are finally good enough to trust with real implementation — bu
 
 So split the roles. Your best model writes the specs and reviews the results. A swarm of cheap workers — Codex, Grok, anything with a CLI — does the implementation in parallel. Your premium budget stops scaling with lines of code written and starts scaling with decisions made.
 
-One problem: parallel agents lie. "Done" doesn't mean working. Ringer doesn't take the worker's word for anything — it **executes your check command** against the artifact. Pass or fail is decided by running the code, not by reading the agent's summary. Failures retry once with the failure context injected, and every attempt is logged so your setup gets measurably better over time.
+One problem: parallel agents lie.
+"Done" does not mean working.
+Ringer does not take the worker's word for anything because it **executes your check command** against the artifact.
+Pass or fail is decided by running the code, not by reading the agent's summary.
+Retryable failures run once more with the failure context injected, while a fast nonzero worker exit stops immediately as a launch-class failure instead of replaying a broken launch.
+Every attempt is logged so your setup gets measurably better over time.
 
 And because a swarm you can't see is a swarm you don't trust: **Ringside**, a local web page every run opens automatically, showing every live swarm on your machine — who's running it, what each worker is doing, elapsed time, token burn — in real time, plus a versioned library of what past runs produced.
 
@@ -18,7 +23,7 @@ And because a swarm you can't see is a swarm you don't trust: **Ringside**, a lo
 manifest.json ──▶ ringer.py ──▶ N parallel workers (codex exec, each in its own dir)
                       │                │
                       │                ▼
-                      │         executed checks ── fail ──▶ retry once w/ failure context
+                      │         executed checks ── retryable fail ──▶ retry once w/ failure context
                       │                │
                       ▼                ▼
               ~/.ringer/runs/    eval log (JSONL or Postgres)
@@ -83,6 +88,16 @@ Run your own batch:
 ```
 
 Each task gets its own directory, its own worker, its own log, and its own verdict. `check` is any shell command — exit 0 is the only thing Ringer believes.
+
+Check for stranded work after a run or an interrupted orchestrator:
+
+```bash
+./ringer.py status
+./ringer.py status --clear-escalations
+```
+
+`status` reports active runs and every unacknowledged task escalation, including tasks recovered from a dead orchestrator, and exits 2 while escalations remain.
+Use `--clear-escalations` only after acting on the displayed records; the clear operation displays exactly what it acknowledges and does not discard a concurrent append.
 
 > **Write checks that print why they fail.** A silent `exit 1` (the `git diff --quiet` style) costs you twice: the retry prompt gets no failure context to fix against, and the eval log records an undiagnosable row. `diff` beats `diff -q`; an assert with a message beats a bare test.
 
