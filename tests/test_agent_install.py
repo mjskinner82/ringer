@@ -61,6 +61,9 @@ class AgentInstallTests(unittest.TestCase):
         skill = self.home / ".claude" / "skills" / "ringer" / "SKILL.md"
         self.assertTrue(skill.exists())
         self.assertEqual((ROOT / ".claude" / "skills" / "ringer" / "SKILL.md").read_text(), skill.read_text())
+        skill_text = skill.read_text(encoding="utf-8")
+        self.assertIn("Run `./ringer.py status`", skill_text)
+        self.assertIn("launch-class failure", skill_text)
 
         settings = self.read_settings()
         hooks = settings["hooks"]

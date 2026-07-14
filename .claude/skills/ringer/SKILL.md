@@ -21,7 +21,7 @@ description: >-
 
 # Ringer orchestrator playbook
 
-## Read this first — the four rules that actually get broken
+## Read this first: the five rules that actually get broken
 
 1. **You review; workers type.** Your lane: specs, checks, pattern choice,
    reading results. If you are typing implementation, running probes, or
@@ -47,13 +47,18 @@ description: >-
    your one-liner, not wondering if anything is happening. Never pass
    `--no-dashboard` except in automated tests or when the user explicitly
    asks.
+5. **Two strikes, then the human.**
+   When the same task or task family has failed two rounds, including a no-mistakes review round, a third identical attempt is forbidden.
+   Run `./ringer.py status`, then change the plan or escalate with the evidence.
+   Every stranded escalation from `status` must be resumed, re-planned, or reported before a new run starts.
 
 Ringer runs manifest tasks in parallel across cheap CLI workers (Codex,
 OpenCode/GLM, others via config) and verifies every task by **executing a
-check command** — exit 0 is the only PASS. Failed tasks are retried once
-with the check's actual failure output injected into the retry prompt. You —
-the orchestrating model — pay tokens only for specs, orchestration, and
-review.
+check command**; exit 0 is the only PASS.
+Eligible `FAIL` and `TIMEOUT` outcomes run once more with the check's actual failure output injected into the retry prompt.
+A `FAIL` whose worker exits nonzero in less than 10,000 ms by default is a launch-class failure and stops without an identical retry; worker spawn errors are also launch class.
+The threshold measures worker time only; `RINGER_LAUNCH_CLASS_THRESHOLD_MS` tunes it in integer milliseconds, values below `0` clamp to `0`, and non-integers use the default.
+You, the orchestrating model, pay tokens only for specs, orchestration, and review.
 
 ```bash
 ./ringer.py lint manifest.json            # always lint before running
@@ -195,21 +200,12 @@ the mix isn't working. This is per-user by design: the scoreboard learns
 THIS user's workload — never import another machine's conclusions or
 recommend from a different user's numbers.
 
-**Explore or the scoreboard fossilizes.** Always recommending the proven
-pick means never learning a new one. In any run of 3+ tasks that has a
-low-stakes lane (docs sweeps, mechanical edits, persona reviews — strong
-executed check, retry to absorb failure), assign roughly ONE task to an
-exploration candidate from `./ringer.py models --explore --task-type <type>`
-(untested + cheap or free, text-capable, decent context). Free promos from
-`catalog --changes` jump the queue — a temporarily-free model is a zero-cost
-experiment. Never explore on time-critical work, never with more than a
-small slice of a batch, and name the experiment when presenting the engine
-ask so the human can veto it. Promotion ladder (computed by --explore):
-untested → probation (some evidence) → proven for a task_type (3+ tasks,
-first-try ≥ 0.67). Proven models earn bigger lanes in that type and an
-audition one rung up in adjacent types; repeated first-attempt failures end
-the audition — record the demotion in MODEL-NOTES so the next orchestrator
-doesn't re-run the experiment.
+**Explore or the scoreboard fossilizes.** Always recommending the proven pick means never learning a new one.
+In any run of 3+ tasks that has a low-stakes lane, such as docs sweeps, mechanical edits, or persona reviews, assign roughly ONE task to an untested, cheap or free, text-capable candidate with a decent context window from `./ringer.py models --explore --task-type <type>` when the executed check is strong and an eligible retry can absorb a check failure.
+Free promos from `catalog --changes` jump the queue because a temporarily-free model is a zero-cost experiment.
+Never explore on time-critical work or with more than a small slice of a batch, and name the experiment when presenting the engine ask so the human can veto it.
+The promotion ladder computed by `--explore` is untested, then probation with some evidence, then proven for a `task_type` at 3+ tasks and `first_try_pass_rate >= 0.67`.
+Proven models earn bigger lanes in that type and an audition one rung up in adjacent types; repeated first-attempt failures end the audition, so record the demotion in MODEL-NOTES and do not rerun the experiment.
 
 **OpenCode is the harness; the model is a manifest field.** Unless a model
 ships its own first-class harness (Codex does), it runs through the
@@ -282,7 +278,15 @@ someone's untracked scratch files.
 
 ## Post-run review ritual
 
-1. Read the run JSON in `~/.ringer/runs/` — statuses, retries, durations.
+0. Run `./ringer.py status`.
+   Exit 0 means no stranded work remains.
+   Exit 2 means escalations or dead runs awaiting matching-state recovery remain; active runs alone are informational.
+   Exit 1 means recovery, review snapshot, or clear persistence failed.
+   Resume, re-plan, or report every escalation before acknowledgement.
+   Run plain `status` before `status --clear-escalations`; clearing refuses an unreviewed ledger and acknowledges only the latest displayed snapshot, so later escalations remain stranded.
+   For a custom state directory, use the matching config with `./ringer.py --config /path/to/config.toml status`.
+   A `launch` class means the engine, environment, or spec must change; `prepare`, `cancelled`, and `orchestrator` identify setup or runner failures, while `work` is an ordinary terminal task failure.
+1. Read the run JSON in `~/.ringer/runs/`: statuses, retries, durations, and `failure_class`.
 2. For any retried or failed task, read the raw worker log in
    `<workdir>/logs/` before deciding anything. Retries that passed on
    attempt 2 often reveal a spec ambiguity worth fixing in your next

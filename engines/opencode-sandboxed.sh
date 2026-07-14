@@ -3,7 +3,8 @@
 #
 # OpenCode has no OS-level sandbox of its own — its --dangerously-skip-permissions
 # flag (required for headless runs) disables ALL of its interactive approval
-# prompts. This wrapper supplies the real containment: full network and reads,
+# prompts. This wrapper supplies the real containment: full network; reads open
+# EXCEPT a deny-list of credential/secret paths (see DENY_READ_CANDIDATES below);
 # writes confined to the task dir, a per-run scratch/cache dir, and OpenCode's
 # own state dirs.
 #
@@ -68,6 +69,83 @@ cat > "$PROFILE" <<'SBEOF'
   (literal "/dev/tty"))
 SBEOF
 
+# Read-surface hardening. The worker keeps network and broad filesystem reads
+# (it must read repos and call APIs), but nothing a worker does should require
+# reading the operator's credentials. Seatbelt evaluates rules in order and the
+# LAST match wins, so denies appended after `(allow default)` close the read
+# hole for the paths below. Values reach the profile as -D parameters, never
+# interpolated into profile text, so a path containing quotes or parens cannot
+# inject rules. Missing paths are skipped.
+#
+# Machine-local additions (cloud drives, work directories, extra key stores):
+#   - one path per line in the file selected by RINGER_OPENCODE_DENY_READ_FILE
+#     (default ~/.config/ringer/opencode-deny-read.txt; '#' comments and leading
+#     '~' both supported), or
+#   - RINGER_OPENCODE_DENY_READ, colon-separated.
+DENY_READ_CANDIDATES=(
+  "$HOME/.ssh"
+  "$HOME/.aws"
+  "$HOME/.gnupg"
+  "$HOME/.secrets"
+  "$HOME/.netrc"
+  "$HOME/.npmrc"
+  "$HOME/.config/gh"
+  "$HOME/.config/gcloud"
+  "$HOME/.codex"
+  "$HOME/.claude"
+  "$HOME/Library/Keychains"
+)
+DENY_READ_FILE="${RINGER_OPENCODE_DENY_READ_FILE:-$HOME/.config/ringer/opencode-deny-read.txt}"
+if [ -f "$DENY_READ_FILE" ]; then
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in ''|'#'*) continue ;; esac
+    DENY_READ_CANDIDATES+=("${_line/#\~/$HOME}")
+  done < "$DENY_READ_FILE"
+fi
+if [ -n "${RINGER_OPENCODE_DENY_READ:-}" ]; then
+  _saved_ifs="$IFS"; IFS=':'
+  for _extra in $RINGER_OPENCODE_DENY_READ; do
+    [ -n "$_extra" ] && DENY_READ_CANDIDATES+=("${_extra/#\~/$HOME}")
+  done
+  IFS="$_saved_ifs"
+fi
+
+DENY_ARGS=()
+_deny_rules=""
+_deny_idx=0
+_deny_seen="|"
+
+# Seatbelt matches the path as PRESENTED, not the symlink-resolved path
+# (verified on macOS: with only realpath(p) denied, a cloud-drive symlink like
+# "~/OneDrive" -> ~/Library/CloudStorage/OneDrive-... stays readable through
+# the symlinked spelling). So deny BOTH the path as written and its resolved
+# target; denying only one leaves the other as a bypass.
+# subpath covers directories and their contents; literal covers plain files.
+_add_deny() {
+  case "$_deny_seen" in *"|$1|"*) return 0 ;; esac
+  _deny_seen="${_deny_seen}$1|"
+  DENY_ARGS+=( -D "DENY_READ_${_deny_idx}=$1" )
+  _deny_rules="${_deny_rules}  (subpath (param \"DENY_READ_${_deny_idx}\"))
+  (literal (param \"DENY_READ_${_deny_idx}\"))
+"
+  _deny_idx=$((_deny_idx + 1))
+  return 0
+}
+
+for _p in "${DENY_READ_CANDIDATES[@]}"; do
+  [ -e "$_p" ] || continue
+  _add_deny "$_p"
+  _real="$(/bin/realpath "$_p" 2>/dev/null || true)"
+  if [ -n "$_real" ] && [ "$_real" != "$_p" ]; then _add_deny "$_real"; fi
+done
+if [ "$_deny_idx" -gt 0 ]; then
+  {
+    printf '(deny file-read*\n'
+    printf '%s' "$_deny_rules"
+    printf ')\n'
+  } >> "$PROFILE"
+fi
+
 export TMPDIR="$SCRATCH"
 export XDG_CACHE_HOME="$SCRATCH/cache"
 mkdir -p "$XDG_CACHE_HOME"
@@ -81,6 +159,7 @@ set +e
   -D "OC_SHARE=$HOME/.local/share/opencode" \
   -D "OC_STATE=$HOME/.local/state/opencode" \
   -D "OC_CONFIG=$HOME/.config/opencode" \
+  ${DENY_ARGS[@]+"${DENY_ARGS[@]}"} \
   -f "$PROFILE" "$OPENCODE_BIN" "$@" < /dev/null
 status=$?
 set -e

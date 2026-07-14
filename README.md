@@ -8,7 +8,12 @@ Frontier models are finally good enough to trust with real implementation — bu
 
 So split the roles. Your best model writes the specs and reviews the results. A swarm of cheap workers — Codex, Grok, anything with a CLI — does the implementation in parallel. Your premium budget stops scaling with lines of code written and starts scaling with decisions made.
 
-One problem: parallel agents lie. "Done" doesn't mean working. Ringer doesn't take the worker's word for anything — it **executes your check command** against the artifact. Pass or fail is decided by running the code, not by reading the agent's summary. Failures retry once with the failure context injected, and every attempt is logged so your setup gets measurably better over time.
+One problem: parallel agents lie.
+"Done" does not mean working.
+Ringer does not take the worker's word for anything because it **executes your check command** against the artifact.
+Pass or fail is decided by running the code, not by reading the agent's summary.
+Eligible `FAIL` and `TIMEOUT` outcomes run once more with the failure context injected, while a `FAIL` after a fast nonzero worker exit stops immediately as a launch-class failure instead of replaying a broken launch.
+Every attempt is logged so your setup gets measurably better over time.
 
 And because a swarm you can't see is a swarm you don't trust: **Ringside**, a local web page every run opens automatically, showing every live swarm on your machine — who's running it, what each worker is doing, elapsed time, token burn — in real time, plus a versioned library of what past runs produced.
 
@@ -18,7 +23,7 @@ And because a swarm you can't see is a swarm you don't trust: **Ringside**, a lo
 manifest.json ──▶ ringer.py ──▶ N parallel workers (codex exec, each in its own dir)
                       │                │
                       │                ▼
-                      │         executed checks ── fail ──▶ retry once w/ failure context
+                      │         executed checks ── retryable fail ──▶ retry once w/ failure context
                       │                │
                       ▼                ▼
               ~/.ringer/runs/    eval log (JSONL or Postgres)
@@ -83,6 +88,34 @@ Run your own batch:
 ```
 
 Each task gets its own directory, its own worker, its own log, and its own verdict. `check` is any shell command — exit 0 is the only thing Ringer believes.
+
+Check for stranded work after a run or an interrupted orchestrator:
+
+```bash
+./ringer.py status
+./ringer.py status --clear-escalations
+```
+
+`status` reports active runs and every unacknowledged task escalation, including tasks recovered from a dead orchestrator.
+Every terminal non-PASS task appends a best-effort JSON record to `<state_dir>/escalations.jsonl` (default `~/.ringer/escalations.jsonl`) and prints a loud `ESCALATION` line.
+Each record identifies the run and task and carries its verdict, failure class, attempt count, check excerpt, and worker-log path.
+If persistence fails, Ringer prints `FAILED TO RECORD` without replacing the run's own outcome.
+The displayed failure class distinguishes ordinary `work` failures from `launch`, `prepare`, `cancelled`, and `orchestrator` failures; the same field is present in the final run-state JSON.
+
+The launch guard classifies a `FAIL` as `launch` when its worker process exits nonzero in less than 10,000 ms by default.
+Worker spawn errors are also `launch` class, while other `ERROR` outcomes are terminal without a retry.
+The threshold measures worker process time, not verification time, and a fast worker exit with code 0 still gets the normal retry because its executed check is what failed.
+Set `RINGER_LAUNCH_CLASS_THRESHOLD_MS` to an integer millisecond value to tune the guard; values below `0` clamp to `0`, which disables the guard, and non-integer values use the 10,000 ms default.
+Fix the engine, environment, or spec before rerunning a `launch` failure.
+
+`status` exit codes are `0` when no stranded work remains, `2` while escalations or dead runs awaiting matching-state recovery remain, and `1` when recovery, review snapshot, or clear persistence fails.
+Active runs are informational and do not by themselves make `status` return nonzero.
+The cross-run recovery registry lives at `$RINGER_HOME/active-runs.json` (default `~/.ringer/active-runs.json`) and records each run's configured state location and task-log paths.
+Dead-run recovery is scoped to the configured `state_dir`; for a non-default config, put the global option before the command: `./ringer.py --config /path/to/config.toml status`.
+
+Use `--clear-escalations` only after acting on records shown by a preceding plain `status` call.
+Plain `status` writes the acknowledgement snapshot to `<state_dir>/escalations.jsonl.review.json`.
+When escalation records exist, the clear operation refuses to proceed without that snapshot and acknowledges only the records in it, so later concurrent or recovered records remain visible.
 
 > **Write checks that print why they fail.** A silent `exit 1` (the `git diff --quiet` style) costs you twice: the retry prompt gets no failure context to fix against, and the eval log records an undiagnosable row. `diff` beats `diff -q`; an assert with a message beats a bare test.
 
@@ -156,7 +189,17 @@ Per-task `"engine": "mymodel"` routes work to it — the invariants (stdin close
 
 Unless a model ships its own first-class harness (Codex does), OpenCode is the harness that runs it — one engine block covers every OpenRouter-served model. `config.sample.toml` includes a ready-to-uncomment engine whose `{model}` placeholder is filled per task from the manifest's `"model"` field, with `model_default` as the fallback. The shipped default is OpenRouter's `z-ai/glm-5.2` — roughly $0.74/M input and $2.33/M output (2026-07), about 20-30x cheaper output than frontier coding models; a complete write-code-and-pass-the-check task lands around a penny.
 
-OpenCode ships no OS sandbox, so the engine's `bin` points at an absolute path to `engines/opencode-sandboxed.sh` (ringer does not resolve engine bins relative to the repo): a macOS Seatbelt wrapper that leaves network and reads open but confines writes to the task dir, a per-run scratch dir (wired as the agent's `TMPDIR`/`XDG_CACHE_HOME`), and OpenCode's own state/config dirs. Its `--dangerously-skip-permissions` flag only silences OpenCode's interactive prompts; Seatbelt is the actual containment. Task paths reach the profile as `sandbox-exec -D` parameters rather than string interpolation, so a task dir with quotes or parens can't inject sandbox rules. `--no-sandbox` is wired as the engine's `full_access_args`, so ringer's `allow_full_access` gate still governs escapes. Non-macOS installs need their own sandbox (or full-access mode).
+OpenCode ships no OS sandbox, so the engine's `bin` points at an absolute path to `engines/opencode-sandboxed.sh` because Ringer does not resolve engine bins relative to the repo.
+The macOS Seatbelt wrapper leaves network open and confines writes to the task dir, a per-run scratch dir (wired as the agent's `TMPDIR`/`XDG_CACHE_HOME`), and OpenCode's own state/config dirs.
+Reads stay broadly open because workers must read repos and docs, except for the default credential deny-list: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.secrets`, `~/.netrc`, `~/.npmrc`, `~/.config/gh`, `~/.config/gcloud`, `~/.codex`, `~/.claude`, and `~/Library/Keychains`.
+Add machine-local paths one per line in `~/.config/ringer/opencode-deny-read.txt`; blank lines and lines starting with `#` are ignored, and a leading `~` expands to the home directory.
+`RINGER_OPENCODE_DENY_READ_FILE` selects a different file, while `RINGER_OPENCODE_DENY_READ` adds colon-separated paths.
+Only paths that exist when the wrapper starts are emitted into the profile.
+Each deny matches both the path as written and its symlink-resolved target because Seatbelt matches the *presented* path, so a cloud-drive symlink would bypass a resolved-only deny.
+Its `--dangerously-skip-permissions` flag only silences OpenCode's interactive prompts; Seatbelt is the actual containment.
+Task paths and deny paths reach the profile as `sandbox-exec -D` parameters rather than string interpolation, so a path with quotes or parentheses cannot inject sandbox rules.
+`--no-sandbox` is wired as the engine's `full_access_args`, so Ringer's `allow_full_access` gate still governs escapes.
+Non-macOS installs need their own sandbox or full-access mode.
 
 Setting it up takes about five minutes:
 
@@ -227,7 +270,9 @@ Read it with:
 ./ringer.py models          # per-(model, task_type) scoreboard across the local log
 ```
 
-The scoreboard reports, per model and task_type: tasks, attempts, `pass_rate`, `first_try_pass_rate`, median duration and token count, and `last_seen`. The signal for routing is `first_try_pass_rate` — the share of tasks that passed on attempt 1 without a retry; `pass_rate` is the rescued rate after Ringer's single retry, so the gap between the two is the cost of the retry lane. Slice the log with `--log` (a different JSONL), `--task-type`, `--model`, `--engine`, `--since`, or `--json` for piping elsewhere.
+The scoreboard reports, per model and task_type: tasks, attempts, `pass_rate`, `first_try_pass_rate`, median duration and token count, and `last_seen`.
+The signal for routing is `first_try_pass_rate`, the share of tasks that passed on attempt 1 without a retry; `pass_rate` is the final rate after any eligible single retry, so the gap between the two is the cost of the retry lane.
+Slice the log with `--log` (a different JSONL), `--task-type`, `--model`, `--engine`, `--since`, or `--json` for piping elsewhere.
 
 History from before the `model` / `task_type` / `retry` columns existed can be seeded in one pass:
 
@@ -282,7 +327,12 @@ Models with local evidence are sorted into tiers:
 - **probation** — some attempts logged but not enough volume or not enough first-try passes. Use it; don't lean on it.
 - **untested** — nothing in the log yet. Pulled from the catalog: text→text, 32k+ context window, up to 10 candidates, FREE models first then cheapest. These are your audition queue.
 
-The promotion ladder is the point. A model enters as **untested**. You spend a small slice of suitable runs — about one task per run — auditioning cheap or free candidates on small, low-stakes work where the executed check is strong and the single retry absorbs the failure: docs sweeps, mechanical edits, persona reviews. While evidence accumulates the model sits on **probation**. At 3+ tasks with `first_try_pass_rate >= 0.67` it's **proven** for that task type and earns a lane on the heavy work. The recommendation flow is the same one this ladder implies: exploit proven models for the load-bearing tasks, and keep spending that small slice auditioning untested candidates so the bench refills itself.
+The promotion ladder is the point.
+A model enters as **untested**.
+You spend a small slice of suitable runs, about one task per run, auditioning cheap or free candidates on small, low-stakes work where the executed check is strong and an eligible single retry can absorb a check failure: docs sweeps, mechanical edits, persona reviews.
+While evidence accumulates the model sits on **probation**.
+At 3+ tasks with `first_try_pass_rate >= 0.67` it is **proven** for that task type and earns a lane on the heavy work.
+The recommendation flow is the same one this ladder implies: exploit proven models for the load-bearing tasks, and keep spending that small slice auditioning untested candidates so the bench refills itself.
 
 The per-user philosophy, stated plainly: every user's workload is different, so the scoreboard learns what works for *your* tasks on *your* machine. A model that's proven in someone else's log is untested in yours until you've run it. The numbers are not portable between users, and the routing recommendations get personal as the log grows — which is exactly why the catalog and the change log stay local and the explore tiers are computed from your own `runs.jsonl`, not from anyone's aggregate.
 
