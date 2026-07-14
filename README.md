@@ -97,7 +97,8 @@ Check for stranded work after a run or an interrupted orchestrator:
 ```
 
 `status` reports active runs and every unacknowledged task escalation, including tasks recovered from a dead orchestrator, and exits 2 while escalations remain.
-Use `--clear-escalations` only after acting on the displayed records; the clear operation displays exactly what it acknowledges and does not discard a concurrent append.
+Use `--clear-escalations` only after acting on the displayed records.
+The clear operation acknowledges only the latest displayed snapshot, so later concurrent or recovered records remain visible.
 
 > **Write checks that print why they fail.** A silent `exit 1` (the `git diff --quiet` style) costs you twice: the retry prompt gets no failure context to fix against, and the eval log records an undiagnosable row. `diff` beats `diff -q`; an assert with a message beats a bare test.
 

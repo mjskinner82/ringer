@@ -288,6 +288,7 @@ someone's untracked scratch files.
 
 0. Run `./ringer.py status`.
    Exit 2 means stranded escalations exist, and each one must be resumed, re-planned, or reported before acknowledgement with `--clear-escalations`.
+   Clearing acknowledges only the latest displayed snapshot, so later escalations remain stranded.
    A launch-class escalation means the engine, environment, or spec must change before another run.
 1. Read the run JSON in `~/.ringer/runs/` — statuses, retries, durations.
 2. For any retried or failed task, read the raw worker log in

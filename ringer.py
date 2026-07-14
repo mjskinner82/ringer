@@ -33,6 +33,7 @@ import tomllib
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import Counter
 from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -826,6 +827,7 @@ class WorkerResult:
     timed_out: bool
     tokens: int | None
     error: str | None = None
+    failure_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -6948,6 +6950,14 @@ class Verifier:
             except asyncio.TimeoutError:
                 kill_process_group(proc)
                 stdout, _ = await proc.communicate()
+        except asyncio.CancelledError:
+            terminate_process_group(proc)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+            except asyncio.TimeoutError:
+                kill_process_group(proc)
+                await proc.communicate()
+            raise
         output = stdout.decode("utf-8", errors="replace") if stdout else ""
         if timed_out:
             output += f"\n[ringer.py] check timed out after {CHECK_TIMEOUT_S}s\n"
@@ -7001,14 +7011,17 @@ class RingerRunner:
     async def run(self) -> int:
         self.manifest.workdir.mkdir(parents=True, exist_ok=True)
         final_state = False
+        task_runs: list[asyncio.Task[None]] = []
         try:
             self.state_writer.start()
             if self.dashboard is not None:
                 self.state_writer.set_port(self.dashboard.start())
-            await asyncio.gather(*(self._run_task(runtime) for runtime in self.runtimes))
+            task_runs = [asyncio.create_task(self._run_task(runtime)) for runtime in self.runtimes]
+            await asyncio.gather(*task_runs)
             final_state = True
             return 0 if all(runtime.status == "pass" for runtime in self.runtimes) else 1
         except asyncio.CancelledError:
+            await self._cancel_task_runs(task_runs)
             with contextlib.suppress(Exception):
                 await self.kill_all_workers()
             self._finish_unfinished_tasks("cancelled")
@@ -7016,6 +7029,7 @@ class RingerRunner:
             final_state = True
             raise
         except Exception:
+            await self._cancel_task_runs(task_runs)
             with contextlib.suppress(Exception):
                 await self.kill_all_workers()
             self._finish_unfinished_tasks("orchestrator")
@@ -7038,6 +7052,15 @@ class RingerRunner:
                     print(f"\nYour results: {results_page}")
                     print("Open it in a browser, or run './ringer.py hud' for the full Ringside view (http://127.0.0.1:8700).")
 
+    @staticmethod
+    async def _cancel_task_runs(task_runs: Iterable[asyncio.Task[None]]) -> None:
+        tasks = list(task_runs)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def kill_all_workers(self) -> None:
         procs = list(self.active_processes.values())
         for proc in procs:
@@ -7048,6 +7071,10 @@ class RingerRunner:
         for proc in procs:
             if proc.returncode is None:
                 kill_process_group(proc)
+        if procs:
+            await asyncio.gather(*(proc.wait() for proc in procs))
+        for proc in procs:
+            self.active_processes.pop(proc.pid, None)
 
     def _finish_unfinished_tasks(self, failure_class: str) -> None:
         for runtime in self.runtimes:
@@ -7103,16 +7130,18 @@ class RingerRunner:
                         f"Previous attempt failed: {failure_context}. Fix it."
                     )
                     continue
+                failure_class = worker.failure_class
+                if worker.error and failure_class is None:
+                    failure_class = "launch"
                 if decision == "terminal-launch":
-                    with self.lock:
-                        runtime.failure_class = "launch"
+                    failure_class = "launch"
                     append_text(
                         runtime.log_path,
                         f"[ringer.py] launch-class failure: worker exited after {worker_duration_ms}ms, "
                         "before real work could happen; an identical retry cannot succeed. "
                         "Fix the engine, environment, or spec, then rerun.\n",
                     )
-                self._finish_failed_task(runtime, verdict)
+                self._finish_failed_task(runtime, verdict, failure_class=failure_class)
                 return
 
     def _harvest_deliverables_on_pass(self, runtime: TaskRuntime) -> None:
@@ -7322,6 +7351,7 @@ class RingerRunner:
                 timed_out=False,
                 tokens=None,
                 error=f"unknown worker engine: {runtime.task.engine}",
+                failure_class="prepare",
             )
         if runtime.task.full_access and not self.config.allow_full_access:
             return WorkerResult(
@@ -7332,6 +7362,7 @@ class RingerRunner:
                     f"task requested full_access with engine {runtime.task.engine}, "
                     "but config allow_full_access is false"
                 ),
+                failure_class="prepare",
             )
         cmd = build_worker_command(
             engine,
@@ -7352,7 +7383,13 @@ class RingerRunner:
         try:
             log_fh = log_path.open("ab")
         except OSError as exc:
-            return WorkerResult(returncode=None, timed_out=False, tokens=None, error=str(exc))
+            return WorkerResult(
+                returncode=None,
+                timed_out=False,
+                tokens=None,
+                error=str(exc),
+                failure_class="prepare",
+            )
         async with AsyncFileCloser(log_fh):
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -7367,29 +7404,44 @@ class RingerRunner:
                 message = f"[ringer.py] worker spawn failed: {exc}\n"
                 log_fh.write(message.encode("utf-8", errors="replace"))
                 log_fh.flush()
-                return WorkerResult(returncode=None, timed_out=False, tokens=None, error=str(exc))
+                return WorkerResult(
+                    returncode=None,
+                    timed_out=False,
+                    tokens=None,
+                    error=str(exc),
+                    failure_class="launch",
+                )
             with self.lock:
                 runtime.worker_pid = proc.pid
             self.active_processes[proc.pid] = proc
             reader = asyncio.create_task(self._tee_stream(proc, log_fh, capture))
             timed_out = False
             try:
-                await asyncio.wait_for(proc.wait(), timeout=runtime.task.timeout_s)
-            except asyncio.TimeoutError:
-                timed_out = True
-                terminate_process_group(proc)
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
+                    await asyncio.wait_for(proc.wait(), timeout=runtime.task.timeout_s)
                 except asyncio.TimeoutError:
-                    kill_process_group(proc)
-                    await proc.wait()
-            try:
-                await asyncio.wait_for(reader, timeout=5)
-            except asyncio.TimeoutError:
-                reader.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await reader
-            self.active_processes.pop(proc.pid, None)
+                    timed_out = True
+                    terminate_process_group(proc)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        kill_process_group(proc)
+                        await proc.wait()
+                try:
+                    await asyncio.wait_for(reader, timeout=5)
+                except asyncio.TimeoutError:
+                    reader.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await reader
+            finally:
+                if not reader.done():
+                    reader.cancel()
+                try:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await reader
+                finally:
+                    if proc.returncode is not None:
+                        self.active_processes.pop(proc.pid, None)
         output_tail = capture.text()
         tokens = parse_token_count(output_tail, engine.token_regex)
         if timed_out:
@@ -7583,6 +7635,11 @@ def escalation_lock_path(state_dir: Path) -> Path:
     return path.with_name(path.name + ".lock")
 
 
+def escalation_review_path(state_dir: Path) -> Path:
+    path = escalations_path(state_dir)
+    return path.with_name(path.name + ".review.json")
+
+
 def _read_escalations_unlocked(path: Path) -> list[dict[str, Any]]:
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -7611,6 +7668,34 @@ def escalation_identity(record: dict[str, Any]) -> str | None:
     if isinstance(run_id, str) and run_id and isinstance(task_key, str) and task_key:
         return f"{run_id}:{task_key}"
     return None
+
+
+def escalation_record_key(record: dict[str, Any]) -> str:
+    identity = escalation_identity(record)
+    if identity is not None:
+        return f"id:{identity}"
+    payload = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"record:{payload}"
+
+
+def _read_escalation_review_unlocked(path: Path) -> list[str] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    record_keys = data.get("record_keys")
+    if not isinstance(record_keys, list) or not all(
+        isinstance(record_key, str) for record_key in record_keys
+    ):
+        return None
+    return record_keys
 
 
 def append_escalation(state_dir: Path, record: dict[str, Any]) -> bool:
@@ -7643,15 +7728,62 @@ def read_escalations(state_dir: Path, limit: int | None = None) -> list[dict[str
     return records[-limit:]
 
 
-def clear_escalations(state_dir: Path) -> tuple[list[dict[str, Any]], OSError | None]:
+def review_escalations(state_dir: Path) -> tuple[list[dict[str, Any]], OSError | None]:
     path = escalations_path(state_dir)
+    records: list[dict[str, Any]] = []
     try:
         with exclusive_file_lock(escalation_lock_path(state_dir)):
             records = _read_escalations_unlocked(path)
-            path.unlink(missing_ok=True)
+            atomic_write_json(
+                escalation_review_path(state_dir),
+                {
+                    "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                    "record_keys": [escalation_record_key(record) for record in records],
+                },
+            )
+    except OSError as exc:
+        return records, exc
+    return records, None
+
+
+def clear_escalations(state_dir: Path) -> tuple[list[dict[str, Any]], OSError | None]:
+    path = escalations_path(state_dir)
+    review_path = escalation_review_path(state_dir)
+    try:
+        with exclusive_file_lock(escalation_lock_path(state_dir)):
+            records = _read_escalations_unlocked(path)
+            if not records:
+                path.unlink(missing_ok=True)
+                review_path.unlink(missing_ok=True)
+                return [], None
+            reviewed_keys = _read_escalation_review_unlocked(review_path)
+            if reviewed_keys is None:
+                return [], OSError(
+                    "no matching status snapshot; run `ringer.py status` before clearing"
+                )
+            reviewed = Counter(reviewed_keys)
+            cleared: list[dict[str, Any]] = []
+            remaining: list[dict[str, Any]] = []
+            for record in records:
+                record_key = escalation_record_key(record)
+                if reviewed[record_key] > 0:
+                    reviewed[record_key] -= 1
+                    cleared.append(record)
+                else:
+                    remaining.append(record)
+            if remaining:
+                atomic_write_text(
+                    path,
+                    "".join(
+                        json.dumps(record, ensure_ascii=False) + "\n" for record in remaining
+                    ),
+                )
+            else:
+                path.unlink(missing_ok=True)
+            review_path.unlink(missing_ok=True)
     except OSError as exc:
         return [], exc
-    return records, None
+    return cleared, None
 
 
 def print_active_runs(active: dict[str, dict[str, Any]]) -> None:
@@ -7700,13 +7832,26 @@ def run_status_command(config: AppConfig, args: Any) -> int:
             print_escalations(cleared)
         else:
             print("stranded escalations: none")
-        remaining = read_escalations(config.state_dir)
+        remaining, review_error = review_escalations(config.state_dir)
+        if review_error is not None:
+            print(
+                "FAILED TO RECORD escalation review snapshot at "
+                f"{escalation_review_path(config.state_dir)}: {review_error}",
+                file=sys.stderr,
+            )
+            return 1
         if remaining:
             print(f"new stranded escalations: {len(remaining)}")
             print_escalations(remaining)
             return 2
         return 2 if pending_dead else 0
-    escalations = read_escalations(config.state_dir)
+    escalations, review_error = review_escalations(config.state_dir)
+    if review_error is not None:
+        print(
+            "FAILED TO RECORD escalation review snapshot at "
+            f"{escalation_review_path(config.state_dir)}: {review_error}",
+            file=sys.stderr,
+        )
     if not escalations:
         if recovery_failures:
             print("stranded escalations: recovery is pending after a persistence failure")
@@ -7714,7 +7859,7 @@ def run_status_command(config: AppConfig, args: Any) -> int:
             print("stranded escalations: dead-run recovery requires the matching state directory")
         else:
             print("stranded escalations: none")
-        if recovery_failures:
+        if recovery_failures or review_error is not None:
             return 1
         return 2 if pending_dead else 0
     print(
@@ -7722,7 +7867,7 @@ def run_status_command(config: AppConfig, args: Any) -> int:
         "then acknowledge with --clear-escalations"
     )
     print_escalations(escalations)
-    return 1 if recovery_failures else 2
+    return 1 if recovery_failures or review_error is not None else 2
 
 
 def build_run_id(run_name: str) -> str:
@@ -8614,7 +8759,7 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument(
         "--clear-escalations",
         action="store_true",
-        help="acknowledge and remove recorded escalations after acting on them",
+        help="acknowledge escalations from the latest displayed status snapshot",
     )
 
     db_parser = subparsers.add_parser("db", help="manage the derived SQLite read model")

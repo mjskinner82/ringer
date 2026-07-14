@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -32,6 +33,7 @@ from ringer import (  # noqa: E402
     clear_escalations,
     escalations_path,
     read_escalations,
+    review_escalations,
     retry_decision,
     run_status_command,
 )
@@ -215,6 +217,11 @@ class EscalationLedgerTests(unittest.TestCase):
             stdout = io.StringIO()
             config = SimpleNamespace(state_dir=state)
             with mock.patch.dict(os.environ, {"RINGER_HOME": str(root / "ringer-home")}):
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        2,
+                        run_status_command(config, SimpleNamespace(clear_escalations=False)),
+                    )
                 with redirect_stdout(stdout):
                     result = run_status_command(
                         config,
@@ -232,6 +239,8 @@ class EscalationLedgerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
             append_escalation(state, {"task_key": "old"})
+            _records, review_error = review_escalations(state)
+            self.assertIsNone(review_error)
             original_read = ringer._read_escalations_unlocked
             writer: list[threading.Thread] = []
             blocked: list[bool] = []
@@ -255,6 +264,69 @@ class EscalationLedgerTests(unittest.TestCase):
             self.assertEqual(["old"], [record["task_key"] for record in cleared])
             self.assertEqual([True], blocked)
             self.assertEqual(["new"], [record["task_key"] for record in read_escalations(state)])
+
+    def test_clear_acknowledges_only_the_last_status_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            config = SimpleNamespace(state_dir=state)
+            append_escalation(
+                state,
+                {
+                    "escalation_id": "run:old",
+                    "run_id": "run",
+                    "task_key": "old",
+                    "verdict": "FAIL",
+                },
+            )
+            with mock.patch.dict(os.environ, {"RINGER_HOME": str(root / "ringer-home")}):
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        2,
+                        run_status_command(config, SimpleNamespace(clear_escalations=False)),
+                    )
+                append_escalation(
+                    state,
+                    {
+                        "escalation_id": "run:new",
+                        "run_id": "run",
+                        "task_key": "new",
+                        "verdict": "FAIL",
+                    },
+                )
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    result = run_status_command(
+                        config,
+                        SimpleNamespace(clear_escalations=True),
+                    )
+
+            self.assertEqual(2, result)
+            self.assertIn("acknowledged and cleared escalations: 1", stdout.getvalue())
+            self.assertIn("new stranded escalations: 1", stdout.getvalue())
+            self.assertEqual(
+                ["new"],
+                [record["task_key"] for record in read_escalations(state)],
+            )
+
+    def test_clear_refuses_unreviewed_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            append_escalation(
+                state,
+                {
+                    "escalation_id": "run:task",
+                    "run_id": "run",
+                    "task_key": "task",
+                    "verdict": "FAIL",
+                },
+            )
+
+            cleared, error = clear_escalations(state)
+
+            self.assertEqual([], cleared)
+            self.assertIsNotNone(error)
+            self.assertEqual(["task"], [record["task_key"] for record in read_escalations(state)])
 
 
 class RunnerLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -353,6 +425,123 @@ class RunnerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             records = read_escalations(runner.config.state_dir)
             self.assertEqual(["task-one"], [record["task_key"] for record in records])
             self.assertEqual("orchestrator", records[0]["failure_class"])
+
+    async def test_unexpected_runner_error_cancels_siblings_before_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = make_runner(Path(tmp))
+            sibling = runner._task_runtime(
+                dataclass_replace(runner.runtimes[0].task, key="task-two")
+            )
+            runner.runtimes.append(sibling)
+            sibling_started = asyncio.Event()
+            events: list[str] = []
+
+            async def run_task(runtime: object) -> None:
+                if runtime is sibling:
+                    sibling_started.set()
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        events.append("sibling-cancelled")
+                        raise
+                await sibling_started.wait()
+                raise RuntimeError("deterministic runner failure")
+
+            async def kill_workers() -> None:
+                events.append("workers-killed")
+
+            runner._run_task = run_task  # type: ignore[method-assign]
+            runner.kill_all_workers = kill_workers  # type: ignore[method-assign]
+            runner.state_writer.start = mock.Mock()
+            runner.state_writer.flush = mock.Mock(return_value={})
+            runner.state_writer.finish = mock.Mock()
+            runner.state_writer.stop = mock.Mock()
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "deterministic runner failure"):
+                    await runner.run()
+
+            self.assertEqual(["sibling-cancelled", "workers-killed"], events)
+
+    async def test_kill_all_workers_waits_for_process_exit(self) -> None:
+        class Process:
+            pid = 123
+            returncode: int | None = None
+            wait_count = 0
+
+            async def wait(self) -> int:
+                self.wait_count += 1
+                self.returncode = -9
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = make_runner(Path(tmp))
+            proc = Process()
+            runner.active_processes[proc.pid] = proc  # type: ignore[assignment]
+            with (
+                mock.patch("ringer.terminate_process_group"),
+                mock.patch("ringer.kill_process_group"),
+                mock.patch("ringer.asyncio.sleep", new=mock.AsyncMock()),
+            ):
+                await runner.kill_all_workers()
+            runner.logger.close()
+
+            self.assertEqual(1, proc.wait_count)
+            self.assertEqual({}, runner.active_processes)
+
+    async def test_worker_error_defaults_to_launch_class(self) -> None:
+        class FailingVerifier:
+            async def verify(self, _task: object, _taskdir: Path) -> VerifyResult:
+                return VerifyResult(
+                    ok=False,
+                    check_returncode=1,
+                    check_timed_out=False,
+                    raw_output_excerpt="worker did not launch",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = make_runner(Path(tmp))
+            runtime = runner.runtimes[0]
+            runner.verifier = FailingVerifier()
+            with (
+                mock.patch.object(
+                    runner,
+                    "_run_worker",
+                    new=mock.AsyncMock(
+                        return_value=WorkerResult(
+                            returncode=None,
+                            timed_out=False,
+                            tokens=None,
+                            error="spawn failed",
+                        )
+                    ),
+                ),
+                mock.patch.object(runner, "_record_task_escalation"),
+            ):
+                await runner._run_task(runtime)
+            runner.logger.close()
+
+            self.assertEqual("launch", runtime.failure_class)
+
+    async def test_full_access_gate_error_is_prepare_class(self) -> None:
+        class FailingVerifier:
+            async def verify(self, _task: object, _taskdir: Path) -> VerifyResult:
+                return VerifyResult(
+                    ok=False,
+                    check_returncode=1,
+                    check_timed_out=False,
+                    raw_output_excerpt="worker did not launch",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = make_runner(Path(tmp))
+            runtime = runner.runtimes[0]
+            runtime.task = dataclass_replace(runtime.task, full_access=True)
+            runner.verifier = FailingVerifier()
+            with mock.patch.object(runner, "_record_task_escalation"):
+                await runner._run_task(runtime)
+            runner.logger.close()
+
+            self.assertEqual("prepare", runtime.failure_class)
 
 
 if __name__ == "__main__":
