@@ -78,6 +78,9 @@ class AgentInstallTests(unittest.TestCase):
         hook_script = self.home / ".local" / "share" / "ringer" / "hooks" / "ringer_nudge.py"
         self.assertTrue(hook_script.exists())
         self.assertEqual((ROOT / "hooks" / "ringer_nudge.py").read_text(), hook_script.read_text())
+        skill_text = skill.read_text(encoding="utf-8")
+        self.assertIn("/Users/mattskinner/.local/bin/ringer status", skill_text)
+        self.assertIn("launch-class failure", skill_text)
 
         settings = self.read_settings()
         hooks = settings["hooks"]

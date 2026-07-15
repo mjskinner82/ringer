@@ -50,6 +50,7 @@ It does not select Ringer or make it mandatory.
 - Make worker file ownership disjoint across concurrent lanes.
 - Make checks executable, content-aware, and informative on failure.
 - Never run no-mistakes or another worker scheduler inside a Ringer manifest.
+- Treat a fast nonzero worker exit as a launch-class failure, stop the identical retry, and change the engine, environment, or spec.
 - Stop after two failed rounds in the same task family, inspect status and evidence, then change the plan or return to the user.
 - Preserve stdin closure, explicit sandbox mode, executed artifact verification, and raw-only worker logs in any Ringer implementation change.
 

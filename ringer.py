@@ -33,6 +33,7 @@ import tomllib
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import Counter
 from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -811,6 +812,7 @@ class TaskRuntime:
     last_check_returncode: int | None = None
     last_check_timed_out: bool = False
     last_check_output: str = ""
+    failure_class: str | None = None
 
     def elapsed_s(self, now: float) -> float:
         if self.started_at_monotonic is None:
@@ -825,6 +827,7 @@ class WorkerResult:
     timed_out: bool
     tokens: int | None
     error: str | None = None
+    failure_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1010,6 +1013,7 @@ class StateWriter:
                         "elapsed_s": round(runtime.elapsed_s(now), 1),
                         "tokens": runtime.tokens,
                         "attempts": runtime.attempts,
+                        "failure_class": runtime.failure_class,
                         "children": ProcessTree.count_named_descendants(
                             runtime.worker_pid, children, commands, process_name
                         ),
@@ -1784,6 +1788,27 @@ def active_runs_path() -> Path:
     return ringer_home() / "active-runs.json"
 
 
+def active_runs_lock_path() -> Path:
+    path = active_runs_path()
+    return path.with_name(path.name + ".lock")
+
+
+@contextlib.contextmanager
+def exclusive_file_lock(path: Path) -> Iterable[None]:
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def pid_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -1814,43 +1839,182 @@ def _read_active_runs_raw(path: Path) -> dict[str, dict[str, Any]]:
     return runs
 
 
-def _prune_active_runs(runs: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    pruned: dict[str, dict[str, Any]] = {}
-    for run_id, entry in runs.items():
-        pid = entry.get("pid")
-        if isinstance(pid, bool):
+def _normalize_active_run(entry: dict[str, Any]) -> dict[str, Any]:
+    pid = entry.get("pid")
+    try:
+        pid_int = 0 if isinstance(pid, bool) else int(pid)
+    except (TypeError, ValueError):
+        pid_int = 0
+    normalized: dict[str, Any] = {
+        "pid": pid_int,
+        "identity": str(entry.get("identity", "")),
+        "run_name": str(entry.get("run_name", "")),
+        "workdir": str(entry.get("workdir", "")),
+        "started_at": str(entry.get("started_at", "")),
+    }
+    for key in ("state_dir", "state_path"):
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            normalized[key] = value
+    tasks = entry.get("tasks")
+    if isinstance(tasks, list):
+        normalized_tasks: list[dict[str, str]] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            key = str(task.get("key", "")).strip()
+            if not key:
+                continue
+            normalized_tasks.append(
+                {
+                    "key": key,
+                    "log_path": str(task.get("log_path", "")),
+                }
+            )
+        if normalized_tasks:
+            normalized["tasks"] = normalized_tasks
+    return normalized
+
+
+def _read_dead_run_state(entry: dict[str, Any]) -> dict[str, Any]:
+    raw_path = entry.get("state_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return {}
+    try:
+        data = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _dead_run_task_records(entry: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    for source in (entry.get("tasks"), state.get("tasks")):
+        if not isinstance(source, list):
             continue
+        for task in source:
+            if not isinstance(task, dict):
+                continue
+            key = str(task.get("key", "")).strip()
+            if key:
+                by_key[key] = {**by_key.get(key, {}), **task}
+    return list(by_key.values())
+
+
+def _dead_run_state_dir(entry: dict[str, Any]) -> Path:
+    raw_state_dir = entry.get("state_dir")
+    if isinstance(raw_state_dir, str) and raw_state_dir:
+        return Path(raw_state_dir)
+    raw_state_path = entry.get("state_path")
+    return Path(raw_state_path).parent.parent if raw_state_path else ringer_home()
+
+
+def _dead_run_escalations(run_id: str, entry: dict[str, Any]) -> tuple[Path, list[dict[str, Any]]]:
+    state = _read_dead_run_state(entry)
+    state_dir = _dead_run_state_dir(entry)
+    tasks = _dead_run_task_records(entry, state)
+    if not tasks:
+        tasks = [{"key": "(unknown-task)", "log_path": entry.get("workdir", "")}]
+    records: list[dict[str, Any]] = []
+    for task in tasks:
+        status = str(task.get("status", "queued"))
+        if status == "pass":
+            continue
+        task_key = str(task.get("key", "(unknown-task)"))
+        verdict = str(task.get("verdict") or "ERROR")
+        failure_class = task.get("failure_class")
+        if not failure_class:
+            failure_class = "work" if status == "fail" else "orchestrator"
         try:
-            pid_int = int(pid)
+            attempts = int(task.get("attempts", 0))
         except (TypeError, ValueError):
-            continue
-        if not pid_is_alive(pid_int):
-            continue
-        pruned[run_id] = {
-            "pid": pid_int,
-            "identity": str(entry.get("identity", "")),
-            "run_name": str(entry.get("run_name", "")),
-            "workdir": str(entry.get("workdir", "")),
-            "started_at": str(entry.get("started_at", "")),
-        }
-    return pruned
+            attempts = 0
+        records.append(
+            {
+                "escalation_id": f"{run_id}:{task_key}",
+                "logged_at": datetime.now(timezone.utc).isoformat(),
+                "run_id": run_id,
+                "task_key": task_key,
+                "verdict": verdict,
+                "failure_class": str(failure_class),
+                "attempts": attempts,
+                "check_excerpt": str(task.get("check_output_tail", ""))[:400],
+                "log_path": str(task.get("log_path", "")),
+            }
+        )
+    return state_dir, records
+
+
+def _reconcile_dead_run(run_id: str, entry: dict[str, Any]) -> list[str]:
+    state_dir, records = _dead_run_escalations(run_id, entry)
+    failures: list[str] = []
+    for record in records:
+        if not append_escalation(state_dir, record):
+            failures.append(f"{run_id}:{record.get('task_key', '(unknown-task)')}")
+    return failures
 
 
 def _write_active_runs(runs: dict[str, dict[str, Any]]) -> None:
     path = active_runs_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(_prune_active_runs(runs), indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(runs, indent=2, sort_keys=True) + "\n")
 
 
-def read_active_runs() -> dict[str, dict[str, Any]]:
+def _reconcile_active_runs_locked(
+    path: Path,
+    recovery_state_dir: Path | None = None,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    list[str],
+    dict[str, dict[str, Any]],
+]:
+    raw_runs = _read_active_runs_raw(path)
+    live: dict[str, dict[str, Any]] = {}
+    retained: dict[str, dict[str, Any]] = {}
+    recovery_failures: list[str] = []
+    pending_dead: dict[str, dict[str, Any]] = {}
+    for run_id, raw_entry in raw_runs.items():
+        entry = _normalize_active_run(raw_entry)
+        if pid_is_alive(int(entry["pid"])):
+            live[run_id] = entry
+            retained[run_id] = entry
+        elif recovery_state_dir is None:
+            retained[run_id] = entry
+            pending_dead[run_id] = entry
+        elif (
+            _dead_run_state_dir(entry).expanduser().resolve()
+            != recovery_state_dir.expanduser().resolve()
+        ):
+            retained[run_id] = entry
+            pending_dead[run_id] = entry
+        else:
+            failures = _reconcile_dead_run(run_id, entry)
+            if failures:
+                retained[run_id] = entry
+                pending_dead[run_id] = entry
+                recovery_failures.extend(failures)
+    if retained != raw_runs:
+        _write_active_runs(retained)
+    return live, retained, recovery_failures, pending_dead
+
+
+def read_active_runs_with_recovery(
+    recovery_state_dir: Path,
+) -> tuple[dict[str, dict[str, Any]], list[str], dict[str, dict[str, Any]]]:
     path = active_runs_path()
-    runs = _read_active_runs_raw(path)
-    pruned = _prune_active_runs(runs)
-    if pruned != runs:
-        _write_active_runs(pruned)
-    return pruned
+    with exclusive_file_lock(active_runs_lock_path()):
+        live, _retained, recovery_failures, pending_dead = _reconcile_active_runs_locked(
+            path,
+            recovery_state_dir,
+        )
+    return live, recovery_failures, pending_dead
+
+
+def read_active_runs(recovery_state_dir: Path | None = None) -> dict[str, dict[str, Any]]:
+    live, _recovery_failures, _pending_dead = read_active_runs_with_recovery(
+        recovery_state_dir or ringer_home()
+    )
+    return live
 
 
 def register_active_run(
@@ -1861,22 +2025,38 @@ def register_active_run(
     *,
     pid: int | None = None,
     started_at: datetime | None = None,
+    state_dir: Path | None = None,
+    state_path: Path | None = None,
+    tasks: list[dict[str, str]] | None = None,
 ) -> None:
-    runs = read_active_runs()
-    runs[run_id] = {
-        "pid": int(pid if pid is not None else os.getpid()),
-        "identity": identity,
-        "run_name": run_name,
-        "workdir": str(workdir),
-        "started_at": (started_at or datetime.now(timezone.utc)).isoformat(),
-    }
-    _write_active_runs(runs)
+    with exclusive_file_lock(active_runs_lock_path()):
+        _live, runs, _recovery_failures, _pending_dead = _reconcile_active_runs_locked(
+            active_runs_path()
+        )
+        entry: dict[str, Any] = {
+            "pid": int(pid if pid is not None else os.getpid()),
+            "identity": identity,
+            "run_name": run_name,
+            "workdir": str(workdir),
+            "started_at": (started_at or datetime.now(timezone.utc)).isoformat(),
+        }
+        if state_dir is not None:
+            entry["state_dir"] = str(state_dir)
+        if state_path is not None:
+            entry["state_path"] = str(state_path)
+        if tasks:
+            entry["tasks"] = tasks
+        runs[run_id] = _normalize_active_run(entry)
+        _write_active_runs(runs)
 
 
 def unregister_active_run(run_id: str) -> None:
-    runs = read_active_runs()
-    runs.pop(run_id, None)
-    _write_active_runs(runs)
+    with exclusive_file_lock(active_runs_lock_path()):
+        _live, runs, _recovery_failures, _pending_dead = _reconcile_active_runs_locked(
+            active_runs_path()
+        )
+        runs.pop(run_id, None)
+        _write_active_runs(runs)
 
 
 def artifacts_dir(state_dir: Path) -> Path:
@@ -6769,6 +6949,14 @@ class Verifier:
             except asyncio.TimeoutError:
                 kill_process_group(proc)
                 stdout, _ = await proc.communicate()
+        except asyncio.CancelledError:
+            terminate_process_group(proc)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+            except asyncio.TimeoutError:
+                kill_process_group(proc)
+                await proc.communicate()
+            raise
         output = stdout.decode("utf-8", errors="replace") if stdout else ""
         if timed_out:
             output += f"\n[ringer.py] check timed out after {CHECK_TIMEOUT_S}s\n"
@@ -6822,22 +7010,28 @@ class RingerRunner:
     async def run(self) -> int:
         self.manifest.workdir.mkdir(parents=True, exist_ok=True)
         final_state = False
+        task_runs: list[asyncio.Task[None]] = []
         try:
             self.state_writer.start()
             if self.dashboard is not None:
                 self.state_writer.set_port(self.dashboard.start())
-            await asyncio.gather(*(self._run_task(runtime) for runtime in self.runtimes))
+            task_runs = [asyncio.create_task(self._run_task(runtime)) for runtime in self.runtimes]
+            await asyncio.gather(*task_runs)
             final_state = True
             return 0 if all(runtime.status == "pass" for runtime in self.runtimes) else 1
         except asyncio.CancelledError:
-            await self.kill_all_workers()
-            with self.lock:
-                now = time.monotonic()
-                for runtime in self.runtimes:
-                    if runtime.status not in {"pass", "fail"}:
-                        runtime.status = "fail"
-                        runtime.final_verdict = "ERROR"
-                        runtime.ended_at_monotonic = runtime.ended_at_monotonic or now
+            await self._cancel_task_runs(task_runs)
+            with contextlib.suppress(Exception):
+                await self.kill_all_workers()
+            self._finish_unfinished_tasks("cancelled")
+            self.state_writer.flush()
+            final_state = True
+            raise
+        except Exception:
+            await self._cancel_task_runs(task_runs)
+            with contextlib.suppress(Exception):
+                await self.kill_all_workers()
+            self._finish_unfinished_tasks("orchestrator")
             self.state_writer.flush()
             final_state = True
             raise
@@ -6857,6 +7051,15 @@ class RingerRunner:
                     print(f"\nYour results: {results_page}")
                     print("Open it in a browser, or run './ringer.py hud' for the full Ringside view (http://127.0.0.1:8700).")
 
+    @staticmethod
+    async def _cancel_task_runs(task_runs: Iterable[asyncio.Task[None]]) -> None:
+        tasks = list(task_runs)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def kill_all_workers(self) -> None:
         procs = list(self.active_processes.values())
         for proc in procs:
@@ -6867,6 +7070,15 @@ class RingerRunner:
         for proc in procs:
             if proc.returncode is None:
                 kill_process_group(proc)
+        if procs:
+            await asyncio.gather(*(proc.wait() for proc in procs))
+        for proc in procs:
+            self.active_processes.pop(proc.pid, None)
+
+    def _finish_unfinished_tasks(self, failure_class: str) -> None:
+        for runtime in self.runtimes:
+            if runtime.status not in {"pass", "fail"}:
+                self._finish_failed_task(runtime, "ERROR", failure_class=failure_class)
 
     async def _run_task(self, runtime: TaskRuntime) -> None:
         async with self.semaphore:
@@ -6885,6 +7097,7 @@ class RingerRunner:
                     runtime.status = "retrying" if retrying else "running"
                 attempt_started = time.monotonic()
                 worker = await self._run_worker(runtime, current_spec, attempt)
+                worker_duration_ms = int((time.monotonic() - attempt_started) * 1000)
                 with self.lock:
                     runtime.worker_pid = None
                     runtime.status = "verifying"
@@ -6906,17 +7119,28 @@ class RingerRunner:
                         runtime.ended_at_monotonic = time.monotonic()
                     await self._cleanup_worktree_on_pass(runtime)
                     return
-                if attempt < max_attempts and verdict in {"FAIL", "TIMEOUT"}:
+                decision = retry_decision(
+                    verdict, worker_duration_ms, attempt, max_attempts, worker.returncode
+                )
+                if decision == "retry":
                     failure_context = build_failure_context(runtime.log_path, verify.raw_output_excerpt)
                     current_spec = (
                         f"{runtime.task.spec}\n\n"
                         f"Previous attempt failed: {failure_context}. Fix it."
                     )
                     continue
-                with self.lock:
-                    runtime.status = "fail"
-                    runtime.final_verdict = verdict
-                    runtime.ended_at_monotonic = time.monotonic()
+                failure_class = worker.failure_class
+                if worker.error and failure_class is None:
+                    failure_class = "launch"
+                if decision == "terminal-launch":
+                    failure_class = "launch"
+                    append_text(
+                        runtime.log_path,
+                        f"[ringer.py] launch-class failure: worker exited after {worker_duration_ms}ms, "
+                        "before real work could happen; an identical retry cannot succeed. "
+                        "Fix the engine, environment, or spec, then rerun.\n",
+                    )
+                self._finish_failed_task(runtime, verdict, failure_class=failure_class)
                 return
 
     def _harvest_deliverables_on_pass(self, runtime: TaskRuntime) -> None:
@@ -7054,9 +7278,6 @@ class RingerRunner:
     async def _record_prepare_error(self, runtime: TaskRuntime, error: str) -> None:
         with self.lock:
             runtime.attempts = 1
-            runtime.status = "fail"
-            runtime.final_verdict = "ERROR"
-            runtime.ended_at_monotonic = time.monotonic()
         verify = VerifyResult(
             ok=False,
             check_returncode=None,
@@ -7065,6 +7286,60 @@ class RingerRunner:
         )
         worker = WorkerResult(returncode=None, timed_out=False, tokens=None, error=error)
         self._log_attempt(runtime, runtime.task.spec, False, worker, verify, "ERROR", 0)
+        self._finish_failed_task(runtime, "ERROR", failure_class="prepare")
+
+    def _finish_failed_task(
+        self,
+        runtime: TaskRuntime,
+        verdict: str,
+        *,
+        failure_class: str | None = None,
+    ) -> None:
+        with self.lock:
+            runtime.worker_pid = None
+            runtime.status = "fail"
+            runtime.final_verdict = verdict
+            runtime.ended_at_monotonic = runtime.ended_at_monotonic or time.monotonic()
+            if failure_class is not None:
+                runtime.failure_class = failure_class
+        self._record_task_escalation(runtime, verdict)
+
+    def _record_task_escalation(self, runtime: TaskRuntime, verdict: str) -> None:
+        # A task that ends non-PASS with nobody told is how work strands
+        # (2026-07-13: a review-fix chain died at 4:19 AM and sat invisible
+        # for 11 hours). The record survives the orchestrator's death.
+        recorded = append_escalation(
+            self.config.state_dir,
+            {
+                "escalation_id": f"{self.run_id}:{runtime.task.key}",
+                "logged_at": datetime.now(timezone.utc).isoformat(),
+                "run_id": self.run_id,
+                "task_key": runtime.task.key,
+                "verdict": verdict,
+                "failure_class": runtime.failure_class,
+                "attempts": runtime.attempts,
+                "check_excerpt": (runtime.last_check_output or "")[:400],
+                "log_path": str(runtime.log_path),
+            },
+        )
+        message = (
+            f"[ringer.py] ESCALATION {runtime.task.key}: {verdict} after "
+            f"{runtime.attempts} attempt(s) [{runtime.failure_class or 'work'}-class]. "
+        )
+        if recorded:
+            print(
+                message
+                + "Recorded for `ringer.py status`; this task is stranded until someone acts.",
+                flush=True,
+            )
+        else:
+            print(
+                message
+                + f"FAILED TO RECORD at {escalations_path(self.config.state_dir)}; "
+                "this task is stranded and requires immediate human action.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     async def _run_worker(self, runtime: TaskRuntime, spec: str, attempt: int) -> WorkerResult:
         log_path = runtime.log_path
@@ -7075,6 +7350,7 @@ class RingerRunner:
                 timed_out=False,
                 tokens=None,
                 error=f"unknown worker engine: {runtime.task.engine}",
+                failure_class="prepare",
             )
         if runtime.task.full_access and not self.config.allow_full_access:
             return WorkerResult(
@@ -7085,6 +7361,7 @@ class RingerRunner:
                     f"task requested full_access with engine {runtime.task.engine}, "
                     "but config allow_full_access is false"
                 ),
+                failure_class="prepare",
             )
         cmd = build_worker_command(
             engine,
@@ -7105,7 +7382,13 @@ class RingerRunner:
         try:
             log_fh = log_path.open("ab")
         except OSError as exc:
-            return WorkerResult(returncode=None, timed_out=False, tokens=None, error=str(exc))
+            return WorkerResult(
+                returncode=None,
+                timed_out=False,
+                tokens=None,
+                error=str(exc),
+                failure_class="prepare",
+            )
         async with AsyncFileCloser(log_fh):
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -7120,29 +7403,44 @@ class RingerRunner:
                 message = f"[ringer.py] worker spawn failed: {exc}\n"
                 log_fh.write(message.encode("utf-8", errors="replace"))
                 log_fh.flush()
-                return WorkerResult(returncode=None, timed_out=False, tokens=None, error=str(exc))
+                return WorkerResult(
+                    returncode=None,
+                    timed_out=False,
+                    tokens=None,
+                    error=str(exc),
+                    failure_class="launch",
+                )
             with self.lock:
                 runtime.worker_pid = proc.pid
             self.active_processes[proc.pid] = proc
             reader = asyncio.create_task(self._tee_stream(proc, log_fh, capture))
             timed_out = False
             try:
-                await asyncio.wait_for(proc.wait(), timeout=runtime.task.timeout_s)
-            except asyncio.TimeoutError:
-                timed_out = True
-                terminate_process_group(proc)
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
+                    await asyncio.wait_for(proc.wait(), timeout=runtime.task.timeout_s)
                 except asyncio.TimeoutError:
-                    kill_process_group(proc)
-                    await proc.wait()
-            try:
-                await asyncio.wait_for(reader, timeout=5)
-            except asyncio.TimeoutError:
-                reader.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await reader
-            self.active_processes.pop(proc.pid, None)
+                    timed_out = True
+                    terminate_process_group(proc)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        kill_process_group(proc)
+                        await proc.wait()
+                try:
+                    await asyncio.wait_for(reader, timeout=5)
+                except asyncio.TimeoutError:
+                    reader.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await reader
+            finally:
+                if not reader.done():
+                    reader.cancel()
+                try:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await reader
+                finally:
+                    if proc.returncode is not None:
+                        self.active_processes.pop(proc.pid, None)
         output_tail = capture.text()
         tokens = parse_token_count(output_tail, engine.token_regex)
         if timed_out:
@@ -7279,6 +7577,299 @@ def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:
     if verify.ok:
         return "PASS"
     return "FAIL"
+
+
+# A FAIL this fast means the worker exited before doing real work (auth,
+# sandbox denial, bad flag, missing binary). An identical retry cannot
+# succeed (2026-07-13: four sub-3s FAIL/FAIL pairs burned slots in one run).
+LAUNCH_CLASS_THRESHOLD_MS = 10_000
+
+
+def launch_class_threshold_ms() -> int:
+    """Return the worker-time launch guard in milliseconds.
+
+    RINGER_LAUNCH_CLASS_THRESHOLD_MS overrides the 10,000 ms default. Integer
+    values clamp at zero, while non-integer values fall back to the default.
+    """
+    raw = os.environ.get("RINGER_LAUNCH_CLASS_THRESHOLD_MS")
+    if raw is None:
+        return LAUNCH_CLASS_THRESHOLD_MS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return LAUNCH_CLASS_THRESHOLD_MS
+
+
+def retry_decision(
+    verdict: str,
+    duration_ms: int,
+    attempt: int,
+    max_attempts: int,
+    worker_returncode: int | None = None,
+) -> str:
+    """Classify the follow-up to a non-PASS attempt.
+
+    Returns "retry", "terminal", or "terminal-launch". Only FAIL and TIMEOUT
+    are retryable at all. A FAIL faster than launch_class_threshold_ms() with
+    a nonzero worker exit is a launch-class failure (the CLI died before doing
+    work) and terminates immediately so the environment or spec gets fixed
+    instead of replayed. A fast FAIL with exit 0 means the worker did work
+    that flunked the check, so that retry is legitimate.
+    """
+    if attempt >= max_attempts or verdict not in {"FAIL", "TIMEOUT"}:
+        return "terminal"
+    if (
+        verdict == "FAIL"
+        and duration_ms < launch_class_threshold_ms()
+        and worker_returncode is not None
+        and worker_returncode != 0
+    ):
+        return "terminal-launch"
+    return "retry"
+
+
+def escalations_path(state_dir: Path) -> Path:
+    return state_dir / "escalations.jsonl"
+
+
+def escalation_lock_path(state_dir: Path) -> Path:
+    path = escalations_path(state_dir)
+    return path.with_name(path.name + ".lock")
+
+
+def escalation_review_path(state_dir: Path) -> Path:
+    path = escalations_path(state_dir)
+    return path.with_name(path.name + ".review.json")
+
+
+def _read_escalations_unlocked(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def escalation_identity(record: dict[str, Any]) -> str | None:
+    escalation_id = record.get("escalation_id")
+    if isinstance(escalation_id, str) and escalation_id:
+        return escalation_id
+    run_id = record.get("run_id")
+    task_key = record.get("task_key")
+    if isinstance(run_id, str) and run_id and isinstance(task_key, str) and task_key:
+        return f"{run_id}:{task_key}"
+    return None
+
+
+def escalation_record_key(record: dict[str, Any]) -> str:
+    identity = escalation_identity(record)
+    if identity is not None:
+        return f"id:{identity}"
+    payload = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"record:{payload}"
+
+
+def _read_escalation_review_unlocked(path: Path) -> list[str] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    record_keys = data.get("record_keys")
+    if not isinstance(record_keys, list) or not all(
+        isinstance(record_key, str) for record_key in record_keys
+    ):
+        return None
+    return record_keys
+
+
+def append_escalation(state_dir: Path, record: dict[str, Any]) -> bool:
+    path = escalations_path(state_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(escalation_lock_path(state_dir)):
+            record_identity = escalation_identity(record)
+            if record_identity is not None and any(
+                escalation_identity(existing) == record_identity
+                for existing in _read_escalations_unlocked(path)
+            ):
+                return True
+            payload = json.dumps(record, ensure_ascii=False) + "\n"
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(payload)
+        return True
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return False
+
+
+def read_escalations(state_dir: Path, limit: int | None = None) -> list[dict[str, Any]]:
+    path = escalations_path(state_dir)
+    with exclusive_file_lock(escalation_lock_path(state_dir)):
+        records = _read_escalations_unlocked(path)
+    if limit is None:
+        return records
+    if limit <= 0:
+        return []
+    return records[-limit:]
+
+
+def review_escalations(state_dir: Path) -> tuple[list[dict[str, Any]], OSError | None]:
+    path = escalations_path(state_dir)
+    records: list[dict[str, Any]] = []
+    try:
+        with exclusive_file_lock(escalation_lock_path(state_dir)):
+            records = _read_escalations_unlocked(path)
+            atomic_write_json(
+                escalation_review_path(state_dir),
+                {
+                    "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                    "record_keys": [escalation_record_key(record) for record in records],
+                },
+            )
+    except OSError as exc:
+        return records, exc
+    return records, None
+
+
+def clear_escalations(state_dir: Path) -> tuple[list[dict[str, Any]], OSError | None]:
+    path = escalations_path(state_dir)
+    review_path = escalation_review_path(state_dir)
+    try:
+        with exclusive_file_lock(escalation_lock_path(state_dir)):
+            records = _read_escalations_unlocked(path)
+            if not records:
+                path.unlink(missing_ok=True)
+                review_path.unlink(missing_ok=True)
+                return [], None
+            reviewed_keys = _read_escalation_review_unlocked(review_path)
+            if reviewed_keys is None:
+                return [], OSError(
+                    "no matching status snapshot; run `ringer.py status` before clearing"
+                )
+            reviewed = Counter(reviewed_keys)
+            cleared: list[dict[str, Any]] = []
+            remaining: list[dict[str, Any]] = []
+            for record in records:
+                record_key = escalation_record_key(record)
+                if reviewed[record_key] > 0:
+                    reviewed[record_key] -= 1
+                    cleared.append(record)
+                else:
+                    remaining.append(record)
+            if remaining:
+                atomic_write_text(
+                    path,
+                    "".join(
+                        json.dumps(record, ensure_ascii=False) + "\n" for record in remaining
+                    ),
+                )
+            else:
+                path.unlink(missing_ok=True)
+            review_path.unlink(missing_ok=True)
+    except OSError as exc:
+        return [], exc
+    return cleared, None
+
+
+def print_active_runs(active: dict[str, dict[str, Any]]) -> None:
+    if active:
+        print(f"active runs: {len(active)}")
+        for run_id, entry in sorted(active.items()):
+            label = entry.get("run_name") or run_id
+            print(f"  {label} ({run_id})")
+    else:
+        print("active runs: none")
+
+
+def print_escalations(records: list[dict[str, Any]]) -> None:
+    for record in records:
+        print(
+            f"  {record.get('logged_at', '?')} {record.get('run_id', '?')} "
+            f"{record.get('task_key', '?')}: {record.get('verdict', '?')} "
+            f"[{record.get('failure_class') or 'work'}-class] log={record.get('log_path', '?')}"
+        )
+
+
+def run_status_command(config: AppConfig, args: Any) -> int:
+    active, recovery_failures, pending_dead = read_active_runs_with_recovery(config.state_dir)
+    print_active_runs(active)
+    if pending_dead:
+        print(f"dead runs awaiting escalation recovery: {len(pending_dead)}")
+        for run_id, entry in sorted(pending_dead.items()):
+            print(f"  {entry.get('run_name') or run_id} ({run_id}) state={_dead_run_state_dir(entry)}")
+    if recovery_failures:
+        print(
+            "FAILED TO RECORD recovered escalations: " + ", ".join(recovery_failures),
+            file=sys.stderr,
+        )
+        if getattr(args, "clear_escalations", False):
+            return 1
+    if getattr(args, "clear_escalations", False):
+        cleared, error = clear_escalations(config.state_dir)
+        if error is not None:
+            print(
+                f"FAILED TO CLEAR escalations at {escalations_path(config.state_dir)}: {error}",
+                file=sys.stderr,
+            )
+            return 1
+        if cleared:
+            print(f"acknowledged and cleared escalations: {len(cleared)}")
+            print_escalations(cleared)
+        else:
+            print("stranded escalations: none")
+        remaining, review_error = review_escalations(config.state_dir)
+        if review_error is not None:
+            print(
+                "FAILED TO RECORD escalation review snapshot at "
+                f"{escalation_review_path(config.state_dir)}: {review_error}",
+                file=sys.stderr,
+            )
+            return 1
+        if remaining:
+            print(f"new stranded escalations: {len(remaining)}")
+            print_escalations(remaining)
+            return 2
+        return 2 if pending_dead else 0
+    escalations, review_error = review_escalations(config.state_dir)
+    if review_error is not None:
+        print(
+            "FAILED TO RECORD escalation review snapshot at "
+            f"{escalation_review_path(config.state_dir)}: {review_error}",
+            file=sys.stderr,
+        )
+    if not escalations:
+        if recovery_failures:
+            print("stranded escalations: recovery is pending after a persistence failure")
+        elif pending_dead:
+            print("stranded escalations: dead-run recovery requires the matching state directory")
+        else:
+            print("stranded escalations: none")
+        if recovery_failures or review_error is not None:
+            return 1
+        return 2 if pending_dead else 0
+    print(
+        f"stranded escalations: {len(escalations)} - resume or report each, "
+        "then acknowledge with --clear-escalations"
+    )
+    print_escalations(escalations)
+    return 1 if recovery_failures or review_error is not None else 2
 
 
 def build_run_id(run_name: str) -> str:
@@ -8109,6 +8700,12 @@ async def run_manifest(
         manifest.run_name,
         manifest.workdir,
         started_at=runner.started_at,
+        state_dir=config.state_dir,
+        state_path=runner.state_writer.path,
+        tasks=[
+            {"key": runtime.task.key, "log_path": str(runtime.log_path)}
+            for runtime in runner.runtimes
+        ],
     )
     try:
         return await runner.run()
@@ -8198,7 +8795,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ringer.py",
         description=(
             "Ringer: deterministic parallel AI-agent orchestrator. Runs manifest tasks in parallel, "
-            "verifies artifacts with executed checks, retries failures once, logs eval rows, "
+            "verifies artifacts with executed checks, retries eligible failures once, logs eval rows, "
             "and serves a live dashboard."
         ),
     )
@@ -8212,7 +8809,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--identity", help="orchestrator identity for HUD state and eval rows")
     run_parser.add_argument("--no-dashboard", action="store_true", help="disable live dashboard")
     run_parser.add_argument("--browser", action="store_true", help="open the dashboard in the browser instead of Ringside")
-    run_parser.epilog = "Set RINGER_NO_CATALOG_REFRESH=1 to skip the non-blocking OpenRouter catalog auto-refresh."
+    run_parser.epilog = (
+        "Set RINGER_NO_CATALOG_REFRESH=1 to skip the non-blocking OpenRouter catalog "
+        "auto-refresh. Set RINGER_LAUNCH_CLASS_THRESHOLD_MS to tune the worker-time "
+        "launch guard in milliseconds; 0 disables it."
+    )
     run_parser.add_argument(
         "--no-artifact",
         action="store_true",
@@ -8227,6 +8828,20 @@ def build_parser() -> argparse.ArgumentParser:
     hud_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     hud_parser.add_argument("--port", type=int, help=f"port to bind on 127.0.0.1 (default: {DEFAULT_HUD_PORT})")
     hud_parser.add_argument("--no-open", action="store_true", help="start the server without opening a browser")
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="show active runs and stranded-task escalations (exit 2 while stranded work remains)",
+    )
+    status_parser.add_argument(
+        "--clear-escalations",
+        action="store_true",
+        help="acknowledge escalations from the latest displayed status snapshot",
+    )
+    status_parser.epilog = (
+        "Exit 0 when no stranded work remains, 2 while escalations or pending dead-run "
+        "recovery remain, and 1 on persistence failure. Active runs are informational."
+    )
 
     db_parser = subparsers.add_parser("db", help="manage the derived SQLite read model")
     db_parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -8308,6 +8923,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_catalog_command(args)
 
         config = AppConfig.load(args.config)
+        if args.command == "status":
+            return run_status_command(config, args)
         if args.command == "db":
             return run_db_command(config, args)
         if args.command == "models":

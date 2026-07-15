@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -14,7 +18,9 @@ sys.path.insert(0, str(ROOT))
 from ringer import (  # noqa: E402
     active_runs_path,
     read_active_runs,
+    read_escalations,
     register_active_run,
+    run_status_command,
     unregister_active_run,
 )
 
@@ -60,7 +66,7 @@ class ActiveRunsTests(unittest.TestCase):
         self.assertEqual([], list(marker.parent.glob("*.tmp")))
         self.assertEqual([], list(marker.parent.glob(".*.tmp")))
 
-    def test_dead_pid_pruned_on_read_and_write(self) -> None:
+    def test_dead_pid_is_retained_until_matching_recovery(self) -> None:
         marker = active_runs_path()
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(
@@ -78,12 +84,121 @@ class ActiveRunsTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        self.assertEqual({}, read_active_runs())
+        self.assertEqual({}, read_active_runs(Path(self.tmp.name) / "other-state"))
+        self.assertEqual(["dead-run"], sorted(json.loads(marker.read_text(encoding="utf-8"))))
+        self.assertEqual([], read_escalations(Path(os.environ["RINGER_HOME"])))
+
+        self.assertEqual({}, read_active_runs(Path(os.environ["RINGER_HOME"])))
         self.assertEqual({}, json.loads(marker.read_text(encoding="utf-8")))
+        records = read_escalations(Path(os.environ["RINGER_HOME"]))
+        self.assertEqual(["(unknown-task)"], [record["task_key"] for record in records])
+        self.assertEqual("orchestrator", records[0]["failure_class"])
 
         register_active_run("live-run", "agent-a", "Live", Path(self.tmp.name))
         data = json.loads(marker.read_text(encoding="utf-8"))
         self.assertEqual(["live-run"], sorted(data))
+
+    def test_dead_run_recovers_each_nonpass_task_from_run_state(self) -> None:
+        state_dir = Path(self.tmp.name) / "state"
+        state_path = state_dir / "runs" / "dead-run.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "run_id": "dead-run",
+                    "tasks": [
+                        {
+                            "key": "done",
+                            "status": "pass",
+                            "verdict": "PASS",
+                            "attempts": 1,
+                            "log_path": str(Path(self.tmp.name) / "done.log"),
+                        },
+                        {
+                            "key": "stranded",
+                            "status": "running",
+                            "attempts": 1,
+                            "log_path": str(Path(self.tmp.name) / "stranded.log"),
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        register_active_run(
+            "dead-run",
+            "agent-a",
+            "Dead",
+            Path(self.tmp.name),
+            pid=99999999,
+            state_dir=state_dir,
+            state_path=state_path,
+            tasks=[
+                {"key": "done", "log_path": str(Path(self.tmp.name) / "done.log")},
+                {"key": "stranded", "log_path": str(Path(self.tmp.name) / "stranded.log")},
+            ],
+        )
+
+        self.assertEqual({}, read_active_runs(state_dir))
+        records = read_escalations(state_dir)
+        self.assertEqual(["stranded"], [record["task_key"] for record in records])
+        self.assertEqual("ERROR", records[0]["verdict"])
+        self.assertEqual("orchestrator", records[0]["failure_class"])
+
+    def test_dead_run_is_retained_when_recovery_cannot_persist(self) -> None:
+        state_dir = Path(self.tmp.name) / "state"
+        register_active_run(
+            "dead-run",
+            "agent-a",
+            "Dead",
+            Path(self.tmp.name),
+            pid=99999999,
+            state_dir=state_dir,
+            tasks=[{"key": "stranded", "log_path": str(Path(self.tmp.name) / "worker.log")}],
+        )
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("ringer.append_escalation", return_value=False):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                result = run_status_command(
+                    SimpleNamespace(state_dir=state_dir),
+                    SimpleNamespace(clear_escalations=False),
+                )
+            retained = json.loads(active_runs_path().read_text(encoding="utf-8"))
+
+        self.assertEqual(1, result)
+        self.assertIn("FAILED TO RECORD recovered escalations", stderr.getvalue())
+        self.assertEqual(["dead-run"], sorted(retained))
+
+    def test_dead_run_waits_for_matching_state_directory(self) -> None:
+        state_dir = Path(self.tmp.name) / "state-a"
+        other_state_dir = Path(self.tmp.name) / "state-b"
+        register_active_run(
+            "dead-run",
+            "agent-a",
+            "Dead",
+            Path(self.tmp.name),
+            pid=99999999,
+            state_dir=state_dir,
+            tasks=[{"key": "stranded", "log_path": str(Path(self.tmp.name) / "worker.log")}],
+        )
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            result = run_status_command(
+                SimpleNamespace(state_dir=other_state_dir),
+                SimpleNamespace(clear_escalations=False),
+            )
+
+        self.assertEqual(2, result)
+        self.assertIn("dead runs awaiting escalation recovery: 1", stdout.getvalue())
+        retained = json.loads(active_runs_path().read_text(encoding="utf-8"))
+        self.assertEqual(["dead-run"], sorted(retained))
+        self.assertEqual([], read_escalations(state_dir))
+
+        self.assertEqual({}, read_active_runs(state_dir))
+        self.assertEqual(["stranded"], [item["task_key"] for item in read_escalations(state_dir)])
 
 
 if __name__ == "__main__":
