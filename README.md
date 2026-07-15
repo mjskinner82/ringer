@@ -157,7 +157,7 @@ A check that cannot fail is trusting the worker with extra steps.
 
 ## Make your agent actually use this
 
-Between swarms, agents drift back to invisible inline work. Reminders decay, so enforcement ships with the product.
+Ringer is an explicit execution mode, so its integration should stay lightweight until the user or repository selects it.
 
 Run one command:
 
@@ -165,11 +165,20 @@ Run one command:
 ./ringer.py install-agent
 ```
 
-It installs the ringer skill — the orchestrator playbook — user-level for Claude Code, and registers two gentle hooks: a Bash hook that notices model-calling or harness commands running outside a live Ringer run, and an edit-loop hook that notices batch editing without a run. Each hook nudges ONCE per session, pointing the agent at the skill.
+It installs the compact Ringer skill and its on-demand references at the universal `.agents` path, keeps Claude Code compatibility, and registers one advisory Bash hook for Claude Code and Codex.
+The hook notices model-calling or harness commands running outside a live Ringer run.
+It advises the agent not to load or launch Ringer automatically, and it stays silent for ordinary commands and edit loops.
+The advisory appears at most once per session.
 
-The hooks never block anything. A user who says "just do it inline" is obeyed; uninstall with `./ringer.py uninstall-agent`.
+The hook script is installed as a copy (`~/.local/share/ringer/hooks/` for user scope, `./.agents/ringer/hooks/` with `--project`), so the hooks keep working even if the clone moves.
+Re-run `./ringer.py install-agent` after updating the repo; it refreshes the copy and replaces any stale hook registrations in place.
+
+The hook never blocks anything.
+Ringer still requires explicit user selection or an explicit closest-repository requirement.
+Uninstall with `./ringer.py uninstall-agent`.
 
 For CI and evals, `config.sample.toml` includes `[engines.mock]` so the enforcement stack can be tested without an API bill.
+The repo's own CI (`.github/workflows/test.yml`) runs the Python test suite and a Ringside `cargo check` on every pull request and push to `main`; run the tests locally with `python3 -m unittest discover -s tests -p 'test_*.py'`.
 
 ## Engines are pluggable
 
@@ -219,6 +228,8 @@ opencode auth login   # select OpenRouter, paste the key
 ```
 
 Route with per-task `"engine": "opencode"`, pick the model with per-task `"model": "openrouter/<any-model>"`, and set reasoning effort via `engine_args`: `["--variant", "low|high|max"]`. A sensible split: mechanical or tightly-specced tasks on the cheap lane, gnarly ones on your frontier engine — the executed check catches shortfalls either way, and `swarm_runs` rows tell you whether the cheap lane's pass rate holds.
+
+If you run several lanes, it helps to give the tiers stable local names. The shipped Ringer skill references three optional aliases — **Sol** (frontier: decomposition, architecture, rescues), **Terra** (workhorse: implementation, debugging, review), and **Luna** (cheap: mechanical edits, tests, verification with an exact check) — but these are operator-defined: names you choose to map to your own engine and `model` values in `~/.config/ringer/config.toml`, not shipped model IDs. Ringer does not resolve them, and the skill's alias guidance applies only if your local configuration defines them; without the aliases, apply the same tier split with explicit `engine`/`model` values.
 
 ### The plan lane: Grok Build CLI
 

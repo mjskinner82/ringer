@@ -4372,7 +4372,6 @@ class PersistentHudServer:
                 if path.startswith("/api/open-folder"):
                     query = urllib.parse.urlparse(path).query
                     params = urllib.parse.parse_qs(query)
-                    name = (params.get("artifact") or [""])[0]
                     run_id = (params.get("run") or [""])[0]
                     artifact_root_dir = (state_dir / "artifacts").resolve()
                     target = artifact_root_dir / "deliverables"
@@ -8436,13 +8435,59 @@ def claude_root(project: bool) -> Path:
     return (Path.cwd() if project else Path.home()) / ".claude"
 
 
+def codex_root(project: bool) -> Path:
+    return (Path.cwd() if project else Path.home()) / ".codex"
+
+
+def agent_scope_root(project: bool) -> Path:
+    return Path.cwd() if project else Path.home()
+
+
 def ringer_skill_source() -> Path:
-    return repo_root() / ".claude" / "skills" / "ringer" / "SKILL.md"
+    return repo_root() / ".claude" / "skills" / "ringer"
 
 
-def ringer_hook_command(action: str) -> str:
-    hook_path = repo_root() / "hooks" / "ringer_nudge.py"
+def ringer_hook_source() -> Path:
+    return repo_root() / "hooks" / "ringer_nudge.py"
+
+
+def installed_hook_path(project: bool) -> Path:
+    if project:
+        return agent_scope_root(project) / ".agents" / "ringer" / "hooks" / "ringer_nudge.py"
+    return Path.home() / ".local" / "share" / "ringer" / "hooks" / "ringer_nudge.py"
+
+
+def ringer_hook_command(action: str, hook_path: Path) -> str:
     return f"python3 {shlex.quote(str(hook_path))} {action}"
+
+
+def unique_paths(paths: Iterable[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    return unique
+
+
+def skill_targets(project: bool) -> list[Path]:
+    base = agent_scope_root(project)
+    return unique_paths(
+        [
+            base / ".agents" / "skills" / "ringer",
+            claude_root(project) / "skills" / "ringer",
+        ]
+    )
+
+
+def hook_config_paths(project: bool) -> list[Path]:
+    return [
+        claude_root(project) / "settings.json",
+        codex_root(project) / "hooks.json",
+    ]
 
 
 def backup_file(path: Path) -> Path | None:
@@ -8478,18 +8523,6 @@ def hook_command_contains(value: Any, needle: str = "ringer_nudge.py") -> bool:
     return isinstance(value, dict) and needle in str(value.get("command", ""))
 
 
-def event_has_ringer_hook(groups: Any) -> bool:
-    if not isinstance(groups, list):
-        return False
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        handlers = group.get("hooks")
-        if isinstance(handlers, list) and any(hook_command_contains(handler) for handler in handlers):
-            return True
-    return False
-
-
 def merge_ringer_hook(settings: dict[str, Any], event: str, matcher: str, command: str) -> bool:
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -8497,9 +8530,23 @@ def merge_ringer_hook(settings: dict[str, Any], event: str, matcher: str, comman
     groups = hooks.setdefault(event, [])
     if not isinstance(groups, list):
         raise ValueError(f"settings hooks.{event} field must be a JSON array")
-    if event_has_ringer_hook(groups):
-        return False
-    groups.append(
+    kept_groups: list[Any] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            kept_groups.append(group)
+            continue
+        handlers = group.get("hooks")
+        if not isinstance(handlers, list):
+            kept_groups.append(group)
+            continue
+        kept_handlers = [handler for handler in handlers if not hook_command_contains(handler)]
+        if len(kept_handlers) == len(handlers):
+            kept_groups.append(group)
+        elif kept_handlers:
+            new_group = dict(group)
+            new_group["hooks"] = kept_handlers
+            kept_groups.append(new_group)
+    kept_groups.append(
         {
             "matcher": matcher,
             "hooks": [
@@ -8510,15 +8557,22 @@ def merge_ringer_hook(settings: dict[str, Any], event: str, matcher: str, comman
             ],
         }
     )
+    if kept_groups == groups:
+        return False
+    hooks[event] = kept_groups
     return True
 
 
-def remove_ringer_hooks(settings: dict[str, Any]) -> int:
+def remove_ringer_hooks(
+    settings: dict[str, Any], events: set[str] | None = None
+) -> int:
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
         return 0
     removed = 0
     for event in list(hooks):
+        if events is not None and event not in events:
+            continue
         groups = hooks[event]
         if not isinstance(groups, list):
             continue
@@ -8551,62 +8605,78 @@ def remove_ringer_hooks(settings: dict[str, Any]) -> int:
 
 
 def install_agent(project: bool = False) -> int:
-    root = claude_root(project)
     skill_source = ringer_skill_source()
-    skill_target = root / "skills" / "ringer" / "SKILL.md"
-    if not skill_source.exists():
+    if not (skill_source / "SKILL.md").exists():
         raise ValueError(f"ringer skill source not found: {skill_source}")
-    skill_target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(skill_source, skill_target)
+    targets = skill_targets(project)
+    for skill_target in targets:
+        if skill_target.exists():
+            shutil.rmtree(skill_target)
+        skill_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(skill_source, skill_target)
 
-    settings_path = root / "settings.json"
-    settings = load_settings(settings_path)
-    changed = False
-    changed |= merge_ringer_hook(
-        settings,
-        "PreToolUse",
-        "Bash",
-        ringer_hook_command("pre-bash"),
-    )
-    changed |= merge_ringer_hook(
-        settings,
-        "PostToolUse",
-        "Edit|Write",
-        ringer_hook_command("post-edit"),
-    )
-    if changed or not settings_path.exists():
-        write_settings(settings_path, settings)
+    hook_source = ringer_hook_source()
+    if not hook_source.exists():
+        raise ValueError(f"ringer hook source not found: {hook_source}")
+    hook_target = installed_hook_path(project)
+    hook_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(hook_source, hook_target)
+
+    hook_results: list[tuple[Path, bool]] = []
+    for settings_path in hook_config_paths(project):
+        settings = load_settings(settings_path)
+        changed = bool(remove_ringer_hooks(settings, events={"PostToolUse"}))
+        changed |= merge_ringer_hook(
+            settings,
+            "PreToolUse",
+            "Bash",
+            ringer_hook_command("pre-bash", hook_target),
+        )
+        if changed or not settings_path.exists():
+            write_settings(settings_path, settings)
+        hook_results.append((settings_path, changed))
 
     scope = "project" if project else "user"
     print(f"Installed ringer agent for {scope} scope.")
-    print(f"Skill: {skill_target}")
-    if changed:
-        print(f"Hooks: added PreToolUse Bash and PostToolUse Edit|Write in {settings_path}")
-    else:
-        print(f"Hooks: already present in {settings_path}")
+    for skill_target in targets:
+        print(f"Skill directory: {skill_target}")
+    print(f"Hook script: {hook_target}")
+    for settings_path, changed in hook_results:
+        status = "added" if changed else "already present"
+        print(f"Hooks: {status} in {settings_path}")
     return 0
 
 
 def uninstall_agent(project: bool = False) -> int:
-    root = claude_root(project)
-    settings_path = root / "settings.json"
     removed_hooks = 0
-    if settings_path.exists():
+    for settings_path in hook_config_paths(project):
+        if not settings_path.exists():
+            continue
         settings = load_settings(settings_path)
-        removed_hooks = remove_ringer_hooks(settings)
-        if removed_hooks:
+        removed = remove_ringer_hooks(settings)
+        removed_hooks += removed
+        if removed:
             write_settings(settings_path, settings)
 
-    skill_dir = root / "skills" / "ringer"
-    removed_skill = False
-    if skill_dir.exists():
-        shutil.rmtree(skill_dir)
-        removed_skill = True
+    removed_skills = 0
+    for skill_target in skill_targets(project):
+        if skill_target.exists():
+            shutil.rmtree(skill_target)
+            removed_skills += 1
+
+    hook_target = installed_hook_path(project)
+    removed_hook_script = hook_target.exists()
+    if removed_hook_script:
+        hook_target.unlink()
+        for directory in (hook_target.parent, hook_target.parent.parent):
+            with contextlib.suppress(OSError):
+                directory.rmdir()
 
     scope = "project" if project else "user"
     print(f"Uninstalled ringer agent for {scope} scope.")
     print(f"Hooks removed: {removed_hooks}")
-    print(f"Skill removed: {'yes' if removed_skill else 'no'}")
+    print(f"Skills removed: {removed_skills}")
+    print(f"Hook script removed: {'yes' if removed_hook_script else 'no'}")
     return 0
 
 
@@ -8820,11 +8890,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     demo_parser.add_argument("--dry-run", action="store_true", help="print the demo plan without spawning codex")
 
-    install_parser = subparsers.add_parser("install-agent", help="install the ringer Claude Code skill and hooks")
-    install_parser.add_argument("--project", action="store_true", help="install into ./.claude instead of ~/.claude")
+    install_parser = subparsers.add_parser("install-agent", help="install the ringer agent skill and Claude/Codex hooks")
+    install_parser.add_argument("--project", action="store_true", help="install into project-local agent config")
 
-    uninstall_parser = subparsers.add_parser("uninstall-agent", help="remove the ringer Claude Code skill and hooks")
-    uninstall_parser.add_argument("--project", action="store_true", help="remove from ./.claude instead of ~/.claude")
+    uninstall_parser = subparsers.add_parser("uninstall-agent", help="remove the ringer agent skill and Claude/Codex hooks")
+    uninstall_parser.add_argument("--project", action="store_true", help="remove from project-local agent config")
     return parser
 
 
