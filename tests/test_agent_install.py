@@ -64,10 +64,16 @@ class AgentInstallTests(unittest.TestCase):
 
         skill = self.home / ".claude" / "skills" / "ringer" / "SKILL.md"
         universal_skill = self.home / ".agents" / "skills" / "ringer" / "SKILL.md"
+        reference = self.home / ".agents" / "skills" / "ringer" / "references" / "manifest-design.md"
         self.assertTrue(skill.exists())
         self.assertTrue(universal_skill.exists())
+        self.assertTrue(reference.exists())
         self.assertEqual((ROOT / ".claude" / "skills" / "ringer" / "SKILL.md").read_text(), skill.read_text())
         self.assertEqual(skill.read_text(), universal_skill.read_text())
+        self.assertEqual(
+            (ROOT / ".claude" / "skills" / "ringer" / "references" / "manifest-design.md").read_text(),
+            reference.read_text(),
+        )
 
         hook_script = self.home / ".local" / "share" / "ringer" / "hooks" / "ringer_nudge.py"
         self.assertTrue(hook_script.exists())
@@ -80,13 +86,11 @@ class AgentInstallTests(unittest.TestCase):
         self.assertEqual("command", hooks["PreToolUse"][0]["hooks"][0]["type"])
         self.assertIn("ringer_nudge.py", hooks["PreToolUse"][0]["hooks"][0]["command"])
         self.assertTrue(hooks["PreToolUse"][0]["hooks"][0]["command"].endswith(" pre-bash"))
-        self.assertEqual("Edit|Write", hooks["PostToolUse"][0]["matcher"])
-        self.assertIn("ringer_nudge.py", hooks["PostToolUse"][0]["hooks"][0]["command"])
-        self.assertTrue(hooks["PostToolUse"][0]["hooks"][0]["command"].endswith(" post-edit"))
+        self.assertEqual([], hooks.get("PostToolUse", []))
 
         codex_hooks = self.read_codex_hooks()["hooks"]
         self.assertEqual("Bash", codex_hooks["PreToolUse"][0]["matcher"])
-        self.assertEqual("apply_patch", codex_hooks["PostToolUse"][0]["matcher"])
+        self.assertEqual([], codex_hooks.get("PostToolUse", []))
         self.assertIn(str(hook_script), codex_hooks["PreToolUse"][0]["hooks"][0]["command"])
 
     def test_second_install_is_idempotent(self) -> None:
@@ -102,8 +106,43 @@ class AgentInstallTests(unittest.TestCase):
 
         self.assertEqual(settings_before, settings_after)
         self.assertEqual(codex_before, codex_after)
-        self.assertEqual(2, len(self.ringer_handlers(settings_after)))
-        self.assertEqual(2, len(self.ringer_handlers(codex_after)))
+        self.assertEqual(1, len(self.ringer_handlers(settings_after)))
+        self.assertEqual(1, len(self.ringer_handlers(codex_after)))
+
+    def test_install_removes_legacy_post_edit_hook_and_preserves_unrelated_handler(self) -> None:
+        settings_path = self.home / ".claude" / "settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PostToolUse": [
+                            {
+                                "matcher": "Edit|Write",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "python3 /tmp/ringer_nudge.py post-edit",
+                                    },
+                                    {"type": "command", "command": "echo keep-post-hook"},
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli("install-agent")
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        settings = self.read_settings()
+        self.assertEqual(1, len(self.ringer_handlers(settings)))
+        self.assertEqual(
+            [{"type": "command", "command": "echo keep-post-hook"}],
+            settings["hooks"]["PostToolUse"][0]["hooks"],
+        )
 
     def test_install_migrates_legacy_checkout_hook_to_stable_path(self) -> None:
         legacy_command = "python3 /tmp/ringer/hooks/ringer_nudge.py pre-bash 2>/dev/null || true"
@@ -315,6 +354,9 @@ class AgentInstallTests(unittest.TestCase):
         self.assertEqual(0, install.returncode, install.stderr)
         self.assertTrue((project / ".claude" / "skills" / "ringer" / "SKILL.md").exists())
         self.assertTrue((project / ".agents" / "skills" / "ringer" / "SKILL.md").exists())
+        self.assertTrue(
+            (project / ".agents" / "skills" / "ringer" / "references" / "run-operations.md").exists()
+        )
         self.assertTrue((project / ".agents" / "ringer" / "hooks" / "ringer_nudge.py").exists())
         self.assertTrue((project / ".claude" / "settings.json").exists())
         self.assertTrue((project / ".codex" / "hooks.json").exists())

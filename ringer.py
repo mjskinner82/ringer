@@ -7853,7 +7853,7 @@ def agent_scope_root(project: bool) -> Path:
 
 
 def ringer_skill_source() -> Path:
-    return repo_root() / ".claude" / "skills" / "ringer" / "SKILL.md"
+    return repo_root() / ".claude" / "skills" / "ringer"
 
 
 def ringer_hook_source() -> Path:
@@ -7886,16 +7886,16 @@ def skill_targets(project: bool) -> list[Path]:
     base = agent_scope_root(project)
     return unique_paths(
         [
-            base / ".agents" / "skills" / "ringer" / "SKILL.md",
-            claude_root(project) / "skills" / "ringer" / "SKILL.md",
+            base / ".agents" / "skills" / "ringer",
+            claude_root(project) / "skills" / "ringer",
         ]
     )
 
 
-def hook_config_specs(project: bool) -> list[tuple[Path, str]]:
+def hook_config_paths(project: bool) -> list[Path]:
     return [
-        (claude_root(project) / "settings.json", "Edit|Write"),
-        (codex_root(project) / "hooks.json", "apply_patch"),
+        claude_root(project) / "settings.json",
+        codex_root(project) / "hooks.json",
     ]
 
 
@@ -7972,12 +7972,16 @@ def merge_ringer_hook(settings: dict[str, Any], event: str, matcher: str, comman
     return True
 
 
-def remove_ringer_hooks(settings: dict[str, Any]) -> int:
+def remove_ringer_hooks(
+    settings: dict[str, Any], events: set[str] | None = None
+) -> int:
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
         return 0
     removed = 0
     for event in list(hooks):
+        if events is not None and event not in events:
+            continue
         groups = hooks[event]
         if not isinstance(groups, list):
             continue
@@ -8011,12 +8015,14 @@ def remove_ringer_hooks(settings: dict[str, Any]) -> int:
 
 def install_agent(project: bool = False) -> int:
     skill_source = ringer_skill_source()
-    if not skill_source.exists():
+    if not (skill_source / "SKILL.md").exists():
         raise ValueError(f"ringer skill source not found: {skill_source}")
     targets = skill_targets(project)
     for skill_target in targets:
+        if skill_target.exists():
+            shutil.rmtree(skill_target)
         skill_target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(skill_source, skill_target)
+        shutil.copytree(skill_source, skill_target)
 
     hook_source = ringer_hook_source()
     if not hook_source.exists():
@@ -8026,20 +8032,14 @@ def install_agent(project: bool = False) -> int:
     shutil.copy2(hook_source, hook_target)
 
     hook_results: list[tuple[Path, bool]] = []
-    for settings_path, post_matcher in hook_config_specs(project):
+    for settings_path in hook_config_paths(project):
         settings = load_settings(settings_path)
-        changed = False
+        changed = bool(remove_ringer_hooks(settings, events={"PostToolUse"}))
         changed |= merge_ringer_hook(
             settings,
             "PreToolUse",
             "Bash",
             ringer_hook_command("pre-bash", hook_target),
-        )
-        changed |= merge_ringer_hook(
-            settings,
-            "PostToolUse",
-            post_matcher,
-            ringer_hook_command("post-edit", hook_target),
         )
         if changed or not settings_path.exists():
             write_settings(settings_path, settings)
@@ -8048,7 +8048,7 @@ def install_agent(project: bool = False) -> int:
     scope = "project" if project else "user"
     print(f"Installed ringer agent for {scope} scope.")
     for skill_target in targets:
-        print(f"Skill: {skill_target}")
+        print(f"Skill directory: {skill_target}")
     print(f"Hook script: {hook_target}")
     for settings_path, changed in hook_results:
         status = "added" if changed else "already present"
@@ -8058,7 +8058,7 @@ def install_agent(project: bool = False) -> int:
 
 def uninstall_agent(project: bool = False) -> int:
     removed_hooks = 0
-    for settings_path, _ in hook_config_specs(project):
+    for settings_path in hook_config_paths(project):
         if not settings_path.exists():
             continue
         settings = load_settings(settings_path)
@@ -8069,9 +8069,8 @@ def uninstall_agent(project: bool = False) -> int:
 
     removed_skills = 0
     for skill_target in skill_targets(project):
-        skill_dir = skill_target.parent
-        if skill_dir.exists():
-            shutil.rmtree(skill_dir)
+        if skill_target.exists():
+            shutil.rmtree(skill_target)
             removed_skills += 1
 
     hook_target = installed_hook_path(project)
